@@ -1,0 +1,2 @@
+# Apple Silicon: Whisper on the GPU (VOICE_WHISPER_BACKEND=mlx)
+mlx-whisper

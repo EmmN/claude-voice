@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Close a voice session: end its Claude Code process (its terminal tab closes with it when it was opened by
+# session-open) and forget it. Usage: session-close <registry key>  (see `sessions`; dispatch passes it)
+# The process gets SIGTERM, which Claude Code handles like quitting; SIGKILL only if it is still there after 8 s.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+key="${1:?usage: session-close <key>}"; f="$VOICE_SHARED/sessions/$key.json"
+[ -f "$f" ] || { echo "no such session: $key"; exit 1; }
+pid=$(jq -r '.pid // empty' "$f"); target=$(jq -r '.distro // empty' "$f"); name=$(jq -r '.name // empty' "$f")
+sid=$(jq -r '.session_id // empty' "$f")
+[ -n "$pid" ] || { echo "$name has no process id (a claude-session tmux entry?); close it in its terminal"; exit 1; }
+run() { if [ "$target" = "$DISTRO" ]; then "$@"; else wsl.exe -d "$target" --cd / --exec "$@"; fi; }
+alive() { run ps -o stat= -p "$pid" 2>/dev/null | grep -q '^[^Z]'; }   # an exited process that is not yet reaped (Z) is gone
+speech_log "session-close: $name (pid $pid, $target)"
+run kill -TERM "$pid" 2>/dev/null
+for _ in $(seq 16); do alive || break; sleep 0.5; done
+alive && { run kill -KILL "$pid" 2>/dev/null; sleep 0.5; }
+# SessionEnd normally unregisters it; make sure, also when Claude was killed
+rm -f "$f" "$VOICE_INBOX/$key.msg" "$VOICE_SHARED/awaiting/$key"
+[ "$(cat "$VOICE_SHARED/jarvis_brain" 2>/dev/null)" = "$key" ] && rm -f "$VOICE_SHARED/jarvis_brain"
+[ "$target" = "$DISTRO" ] && [ -n "$sid" ] && rm -f "$VOICE_HOME/sessions/$sid" "$VOICE_HOME/sessions/.$sid.waiter"
+if alive; then echo "could not stop $name (pid $pid)"; exit 1; fi
+echo "closed $name"

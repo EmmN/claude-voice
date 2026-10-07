@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Start a voice-addressable Claude Code session: `claude-session <name> [claude args]`.
+# Runs claude inside a tmux session called <name>, turns voice on for it, registers it so the listener can route
+# "hey Jarvis, for the <name> session, …" to it (also from other WSL distros), then attaches.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+name="${1:?usage: claude-session <name> [claude args]}"; shift || true
+name=$(printf '%s' "$name" | tr 'A-Z ' 'a-z_' | tr -cd 'a-z0-9_-')
+if tmux has-session -t "=$name" 2>/dev/null; then exec tmux attach -t "=$name"; fi
+tmux new-session -d -s "$name" -c "$PWD" "claude $*"
+(
+  for _ in $(seq 1 60); do
+    pane_pid=$(tmux list-panes -t "=$name" -F '#{pane_pid}' 2>/dev/null | head -1)
+    for pid in $(pgrep -P "${pane_pid:-0}" 2>/dev/null) "$pane_pid"; do
+      f="$HOME/.claude/sessions/$pid.json"
+      if [ -s "$f" ]; then
+        sid=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('sessionId',''))" "$f")
+        [ -n "$sid" ] || continue
+        : > "$VOICE_HOME/sessions/$sid"
+        printf '{"name":"%s","distro":"%s","tmux":"%s","session_id":"%s","cwd":"%s","started":%s}\n' \
+          "$name" "$DISTRO" "$name" "$sid" "$PWD" "$(date +%s)" > "$VOICE_SHARED/sessions/${DISTRO}__${name}.json"
+        printf '%s' "${DISTRO}__${name}" > "$VOICE_HOME/focus"
+        exit 0
+      fi
+    done
+    sleep 1
+  done
+) &
+exec tmux attach -t "=$name"

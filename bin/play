@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Play a WAV and wait until it has finished: `play <file.wav>`. Stops early when the stop file is touched after it
+# began (`voice stop`, the wake phrase, talking over a prompt) and gives up after the clip's length + 5 s so a stuck
+# audio sink never hangs. Per platform:
+#   wsl:   the Windows-side player (windows/player.ps1) when it runs, so WSL opens no audio output (WSLg breaks
+#          playback up while the listener records); else ffmpeg → WSLg PulseAudio while the player is started.
+#   mac:   afplay.
+#   linux: ffmpeg → PulseAudio.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+wav="${1:?usage: play file.wav}"; [ -s "$wav" ] || exit 1
+T0=$(now_ns); STOP="${VOICE_LOCK%.lock}.stop"
+stopped() { [ -f "$STOP" ] && newer_or_equal "$(mtime_ns "$STOP")" "$T0"; }
+limit=$(( ($(wc -c < "$wav") / 44100 + 5) * 10 ))   # tenths of a second (piper writes 22.05 kHz 16-bit mono)
+if [ "$PLATFORM" = wsl ] && [ "${VOICE_PLAYER:-windows}" = windows ]; then
+  if player_alive; then
+    q="$PLAYER_QUEUE/$(date +%s%N)-$$.wav"   # the player plays them in name order
+    cp "$wav" "$q.part" && mv "$q.part" "$q"
+    for _ in $(seq "$limit"); do [ -e "$q" ] || exit 0; player_alive || break; sleep 0.1; done
+    rm -f "$q"; exit 0
+  fi
+  start_player
+fi
+case "$PLATFORM" in
+  mac) afplay "$wav" >/dev/null 2>&1 & player=$! ;;
+  *)   ffmpeg -nostdin -hide_banner -loglevel error -i "$wav" -f pulse claude-voice >/dev/null 2>&1 & player=$! ;;
+esac
+for _ in $(seq "$limit"); do kill -0 "$player" 2>/dev/null || exit 0; stopped && break; sleep 0.1; done
+kill "$player" 2>/dev/null; exit 0

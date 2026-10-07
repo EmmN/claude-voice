@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# Route a spoken request to a Claude Code session. Usage: dispatch "<transcript>" | dispatch --text "<transcript>"
+# (parse only) | dispatch --state (JSON {sessions, focus} for the listener's greeting).
+# Grammar: "list sessions" / "which sessions are open"; "switch to <name>" (optionally "… and <request>"), or just a
+# session name; "for the <name> session …", "on <name>, …", "tell/ask <name> …"; "all sessions …" (broadcast);
+# otherwise the focused session (~/.claude/voice/focus, set by /speak on and by addressing a session).
+# Anything else goes to the local brain (bin/brain, ollama): a request for a session (focused or named), an answer from
+# Jarvis itself (`answer | <text>`), or a question for Jarvis's Claude brain (`ask <name> | <body>`, see `voice jarvis`).
+# "stop" / "never mind" → `cancel`. Prints `sent <name> | <body>`, `broadcast <n> | <body>`, `list <n> | <name>, <name>`, `focus <name> | <body>`, or `nomatch <reason>`.
+# Delivery: sessions registered by `/speak on` get the request in their inbox file (hook-inbox hands it to Claude);
+# sessions started with claude-session (registry entry has "tmux") get it typed into their tmux pane.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+mode=send; case "${1:-}" in --text) mode=dry; shift;; --state) mode=state; shift;; esac
+text="${*:-}"; [ -n "$text" ] || [ "$mode" = state ] || { echo "nomatch empty"; exit 1; }
+python3 - "$VOICE_SHARED/sessions" "$VOICE_INBOX" "$DISTRO" "$VOICE_HOME/focus" "$mode" "$text" "$HERE" "$VOICE_SHARED/jarvis_brain" <<'PY'
+import glob, json, os, re, subprocess, sys
+reg, inbox, distro, focus_path, mode, text = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6].strip()
+here, brain_path = sys.argv[7], sys.argv[8]
+sessions = {}
+for p in glob.glob(os.path.join(reg, "*.json")):
+    try: d = json.load(open(p))
+    except Exception: continue
+    if d.get("distro") == distro and d.get("pid"):
+        try: os.kill(int(d["pid"]), 0)                        # still alive? (no /proc on macOS)
+        except (OSError, ValueError): os.remove(p); continue  # this machine's Claude exited: forget it
+    sessions[os.path.basename(p)[:-5]] = d
+def spoken(key): return sessions[key]["name"].replace("_", " ").replace("-", " ")
+focus = open(focus_path).read().strip() if os.path.exists(focus_path) else ""
+if focus not in sessions: focus = next(iter(sessions)) if len(sessions) == 1 else ""
+# the listener sets VOICE_NO_FOCUS=1 until you name a session in the conversation: with several sessions, a request
+# never goes to whichever one happened to be focused last time
+if os.environ.get("VOICE_NO_FOCUS") == "1" and len(sessions) > 1 and mode != "state": focus = ""
+if mode == "state":
+    print(json.dumps({"sessions": [spoken(k) for k in sorted(sessions)], "focus": spoken(focus) if focus else ""})); sys.exit()
+
+def norm(s): return re.sub(r"[^a-z0-9 ]", " ", s.lower().replace("_", " ").replace("-", " ")).split()
+FILL = {"the", "session", "sessions", "one", "that", "my", "please"}
+def match(phrase):
+    want = set(norm(phrase)) - FILL
+    if not want: return None
+    best = max(sessions.items(), key=lambda kv: len(want & set(norm(kv[1]["name"]))), default=None)
+    return best[0] if best and want & set(norm(best[1]["name"])) else None
+def take_name(rest):
+    """Longest leading word span of `rest` made only of a session's name words → (key, remainder)."""
+    words, best = rest.split(), (None, rest)
+    for k in range(1, min(6, len(words)) + 1):
+        want = set(norm(" ".join(words[:k]))) - FILL
+        if not want: continue
+        hits = [key for key, d in sessions.items() if want <= set(norm(d["name"]))]
+        if len(hits) == 1:
+            rem = " ".join(words[k:])
+            best = (hits[0], re.sub(r"^(?:session)?[ ,:.]*(?:and|to|that|please)?[ ,:]*", "", rem, flags=re.I))
+        elif not hits and best[0]: break
+    return best
+# a polite or noisy start ("can you", "please", "I want to", a misheard bit of the wake word) does not change the command
+LEAD = r"^(?:ok|okay|hey|hi|hello|jarvis)?[ ,.]*(?:(?:can|could|would|will) you |please |i want (?:you )?to |i'?d like (?:you )?to |let'?s |go ahead and )*"
+# Whisper often hears a leading "tell" as "stell", "tel" or "tall"; read it as "tell" when a session name follows, so
+# "stell webshop, check …" goes to webshop and not to a session whose name merely sounds like "stell"
+m = re.match("(" + LEAD + r")(?:stell|tel|tall|tale)\b[ ,]*(.*)$", text, flags=re.I)
+if m and take_name(m.group(2))[0]: text = m.group(1) + "tell " + m.group(2)
+# a session name heard split into words ("web shop 7c" for webshop-7c) is put back together, wherever it starts
+compact = lambda s: "".join(norm(s))
+for key in sessions:
+    want, ws = compact(sessions[key]["name"]), text.split()
+    for i in range(len(ws)):
+        span = next((j for j in range(i + 2, min(i + 6, len(ws)) + 1) if compact(" ".join(ws[i:j])) == want), None)
+        if span:
+            tail = re.match(r".*?([,.:;!?]*)$", ws[span - 1]).group(1)
+            text = " ".join(ws[:i] + [spoken(key) + tail] + ws[span:]); break
+def mentioned(key):   # the sentence says the name, or one of its words ("the calendar one" for calendar sync)
+    return compact(sessions[key]["name"]) in compact(text) or bool(({w for w in norm(spoken(key)) if len(w) > 1} - FILL) & set(norm(text)))
+low = re.sub(r"[.?!]+$", "", text.lower()).strip()
+# "webshop, standup, never mind": a sentence that ends by taking itself back is a cancel, whatever came before
+if re.search(r"(?:^|[,.;]\s*)(?:never ?mind|forget it|cancel(?: that)?|scratch that)$", low):
+    print("cancel"); sys.exit()
+if re.match(LEAD + r"(?:stop|cancel|never ?mind|nothing(?: else)?|forget it|shut up|(?:be )?quiet|silence|enough|hush|that'?s (?:all|it)|no(?:pe)?|no thanks?|i'?m (?:good|done)|all good|we'?re done)(?: (?:it|that|talking|please|thanks?|jarvis))*$", low):
+    print("cancel"); sys.exit()
+# short "we're done" replies to "anything else?": "nothing right now, I think we're good", "no, that's all for now"
+if len(low.split()) <= 10 and re.search(r"\b(we'?re (good|done|fine|all set)|i'?m (good|done|fine|all set)|nothing (else|right now|for now|more)|that'?s (all|it)( for now)?|no more|all set|not right now|not now)\b", low) \
+        and not re.search(r"\b(tell|ask|run|check|show|list|open|fix|send|switch|go|close|shut|end|kill|quit|resume|start)\b", low):
+    print("cancel"); sys.exit()
+# "start a session in <project> [called <name>] [on the <distro> distro] [and ask it to <request>]" → `open <dir> |
+# <name> | <request> | <distro>`; "close the <name> session" → `close <name> | <key>`. Nothing is started or closed
+# here: the listener asks you to confirm, then runs session-open / session-close.
+def ai_pick(kind, phrase, options):
+    """When word matching finds nothing: ask the local ollama model (the brain's) which of `options` the spoken
+    `phrase` means → its index, or None (no fit, or ollama down/slow). Whatever it picks is confirmed aloud later."""
+    if not options or os.environ.get("JARVIS_BRAIN", "1") == "0": return None
+    import urllib.request
+    listing = "\n".join(f"{i}: {o}" for i, o in enumerate(options))
+    ask = (f"The user said they want the {kind} \"{phrase}\" (spoken, transcribed by Whisper, so words may be misheard "
+           f"or split differently). Which of these {kind}s do they mean?\n{listing}\n"
+           'Reply with only a JSON object: {"index": <number>} for the best match, or {"index": -1} if none fits.')
+    body = json.dumps({"model": os.environ.get("JARVIS_MODEL") or os.environ.get("SPEECHIFY_MODEL") or "gemma4:e4b",
+                       "stream": False, "think": False, "keep_alive": os.environ.get("JARVIS_KEEP_ALIVE", "30m"),
+                       "options": {"temperature": 0, "num_predict": 20, "num_ctx": int(os.environ.get("VOICE_NUM_CTX", "4096"))},
+                       "messages": [{"role": "user", "content": ask}]}).encode()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(os.environ.get("OLLAMA_URL", "http://localhost:11434") + "/api/chat",
+                                   body, {"Content-Type": "application/json"}), timeout=float(os.environ.get("JARVIS_TIMEOUT", "8")))
+        c = json.loads(r.read())["message"]["content"]; i = int(json.loads(c[c.index("{"):c.rindex("}") + 1])["index"])
+        return i if 0 <= i < len(options) else None
+    except Exception: return None
+
+def words_of(s): return set(norm(re.sub(r"([a-z])([A-Z])", r"\1 \2", s)))
+def project_dirs(dist):
+    roots = os.environ.get("VOICE_PROJECTS", "~/projects")
+    if dist == distro:
+        out = []
+        for r in roots.split(":"):
+            r = os.path.expanduser(r)
+            try: out += [os.path.join(r, d) for d in os.listdir(r) if os.path.isdir(os.path.join(r, d))]
+            except OSError: pass
+        return out
+    try:   # another WSL distro: list its folders there
+        r = subprocess.run(["wsl.exe", "-d", dist, "--cd", "/", "--exec", "sh", "-c",
+                            'for r in $(echo "$0" | tr ":" " "); do r=$(eval echo "$r"); for d in "$r"/*/; do echo "${d%/}"; done; done', roots],
+                           capture_output=True, text=True, timeout=20)
+        return [l for l in r.stdout.splitlines() if l and "*" not in l]
+    except Exception: return []
+def best_dir(phrase, dirs):
+    import difflib
+    want = set(norm(phrase)) - {"the", "project", "folder", "repo", "repository"}
+    if not want: return None
+    flat = "".join(norm(phrase))   # "team hub widgets" → "teamhubwidgets", to compare with teamhub-widgets
+    def score(d):
+        name = os.path.basename(d); have = words_of(name)
+        return max(len(want & have) / len(want | have), difflib.SequenceMatcher(None, flat, "".join(norm(name))).ratio() - 0.15)
+    scored = sorted(((score(d), d) for d in dirs), reverse=True)
+    if scored and scored[0][0] < 0.5: return None                   # nothing convincing: the local model gets a go
+    if not scored or scored[0][0] == 0: return None
+    if len(scored) > 1 and scored[1][0] == scored[0][0]:          # equally good: prefer the shortest name
+        return min((d for sc, d in scored if sc == scored[0][0]), key=len)
+    return scored[0][1]
+# Past sessions. "list the old sessions [in <project>]" → `history | <json rows>` (the newest five); "resume
+# <words> [in <project>]" / "reopen …" / "go back to …" → `resume | <json row>` for one clear match by title, or
+# `history | …` with the close candidates to choose from. "resume the last session [in X]" takes the newest. A resume
+# or continue that matches no session well falls through, so "continue with the tests" is still a request.
+def past(query="", project="", limit=5):
+    args = [os.path.join(here, "recent-sessions"), "--limit", str(limit)] + (["--query", query] if query else []) + \
+           (["--project", project] if project else []) + (["--all-distros"] if os.environ.get("PLATFORM") == "wsl" else [])
+    r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    rows = [json.loads(l) for l in r.stdout.splitlines() if l.startswith("{")]
+    return sorted(rows, key=lambda r: (-r["score"], -r["mtime"]) if query else (-r["mtime"],))
+# anywhere in the sentence, so "AGR with can you list the old sessions from webshop" still counts
+m = re.search(r"\b(?:list|show|tell|what|give|read|find|which|any)\b.*?\b(?:old|older|previous|past|recent|last|earlier)(?: claude)?(?: code)? (?:sessions|conversations)\b(?:\s+(?:in|for|from|of)\s+(?:the\s+)?(.+?))?(?:\s+(?:project|folder|repo))?$", low)
+if m:
+    rows = past(project=m.group(1) or "", limit=5)
+    if not rows: print("nomatch no past sessions" + (f" | {m.group(1)}" if m.group(1) else "")); sys.exit(1)
+    print("history | " + json.dumps(rows[:5])); sys.exit()
+m = re.match(LEAD + r"(?:please )?(?:resume|reopen|re open|continue|bring back|go back to|open again)\s+(?:the\s+)?(?:old\s+|previous\s+)?(?:(?:session|conversation)\s+)?(?:(?:about|called|named|on)\s+)?(.+?)[.!?]?$", text, flags=re.I)
+if m:
+    q, proj = m.group(1), ""
+    loose = not re.match(LEAD + r"(?:please )?continue\b", text, flags=re.I)   # "continue with the tests" is a request
+    pm = re.search(r"\s+(?:in|from)\s+(?:the\s+)?([\w .-]+?)(?:\s+(?:project|folder|repo))?$", q, flags=re.I)
+    if pm and best_dir(pm.group(1), project_dirs(distro)):   # only a real folder counts as "in <project>"
+        q, proj = q[:pm.start()], os.path.basename(best_dir(pm.group(1), project_dirs(distro)))
+    if re.fullmatch(r"(?:the\s+)?(?:last|latest|most recent|newest)(?:\s+(?:session|conversation|one))?", q.strip(), flags=re.I):
+        rows = past(project=proj, limit=1)
+        if rows: print("resume | " + json.dumps(rows[0])); sys.exit()
+    else:
+        rows = past(query=q, project=proj, limit=5)
+        want = set(norm(q)) - FILL - {"old", "previous", "about"}
+        exact = [r for r in rows if set(norm(r["title"])) == want]
+        if exact: print("resume | " + json.dumps(exact[0])); sys.exit()        # the title, word for word
+        good = [r for r in rows if r["score"] >= (0.75 if loose else 0.9)]
+        if good and (len(good) == 1 or good[0]["score"] - good[1]["score"] >= 0.05):
+            print("resume | " + json.dumps(good[0])); sys.exit()
+        close = [r for r in rows if r["score"] >= 0.6][:4]
+        if close and loose: print("history | " + json.dumps(close)); sys.exit()
+        if loose:   # nothing close by words: let the local model look through the last 150 titles
+            recent = past(project=proj, limit=150)
+            i = ai_pick("past Claude Code session", q, [f"{r['title']} (in {r['project']})" for r in recent])
+            if i is not None: print("resume | " + json.dumps(recent[i])); sys.exit()
+m = re.match(LEAD + r"(?:please |can you |could you )?(?:start|open|create|launch|spin up|make)(?: me)?(?: a| another| one more)?(?: new)?(?: claude)?(?: code)? session\b[ ,]*(.*)$", text, flags=re.I)
+if m:
+    rest, request, target = m.group(1).strip(" .,"), "", distro
+    r = re.search(r"[ ,]*\b(?:and |then )?(?:ask|tell|have|get) it(?: to)?\b[ ,]*(.*)$", rest, flags=re.I)
+    if r: request, rest = r.group(1).strip(" ."), rest[:r.start()]
+    d = re.search(r"\b(?:on|in) (?:the )?((?:(?!\b(?:on|in)\b).)+?) (?:distro|distribution)\b", rest, flags=re.I)
+    if d:
+        want = set(norm(d.group(1)))
+        known = {e.get("distro") for e in sessions.values()} | {distro}
+        if os.environ.get("PLATFORM") == "wsl":
+            lr = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True)
+            known |= set(lr.stdout.decode("utf-16-le", "ignore").replace("\r", "").split())
+        hit = max(known, key=lambda k: len(want & words_of(k)))
+        if want & words_of(hit): target = hit
+        rest = rest[:d.start()] + rest[d.end():]
+    n = re.search(r"\b(?:called|named)\s+(.+?)(?=\s+\b(?:in|for|at|on)\b|$)", rest, flags=re.I)
+    name = n.group(1).strip(" .,") if n else ""
+    if n: rest = rest[:n.start()] + rest[n.end():]
+    pj = re.search(r"\b(?:in|for|at|on)\s+(?:the\s+)?(.+)$", rest, flags=re.I)
+    phrase = (pj.group(1) if pj else rest).strip(" .,")
+    dirs = project_dirs(target)
+    folder = best_dir(phrase, dirs) if phrase else None
+    if phrase and not folder:
+        i = ai_pick("project folder", phrase, [os.path.basename(d) for d in dirs])
+        folder = dirs[i] if i is not None else None
+    if not phrase:   # no project named: offer the folders you use most (any other one can still be named)
+        r = subprocess.run([os.path.join(here, "recent-sessions"), "--top-projects", "3"], capture_output=True, text=True)
+        top = [json.loads(l) for l in r.stdout.splitlines() if l.startswith("{")]
+        print("pickproject | " + json.dumps({"top": top, "name": name, "request": request, "distro": target})); sys.exit()
+    if not folder: print("nomatch which project" + (f" | {phrase}" if phrase else "")); sys.exit(1)
+    name = name or os.path.basename(folder)
+    # the distro only when it is another one (the listener then says "on <distro>"; session-open defaults to here)
+    print(f"open {folder} | {name} | {request} | {target if target != distro else ''}"); sys.exit()
+m = re.match(LEAD + r"(?:please )?(?:close|end|quit|exit|kill|stop|shut down|terminate)\s+(?:the\s+)?(.+?)(?:\s+(?:session|one))?[.!]?$", text, flags=re.I)
+if m and sessions:
+    k = match(m.group(1))
+    if k and set(norm(m.group(1))) - FILL <= set(norm(sessions[k]["name"])) | {"claude", "code"}:   # every word names it
+        print(f"close {spoken(k)} | {k}"); sys.exit()
+# with no voice session the brain may still find a session command ("pull up that flaky tests thing"), so go on
+if not sessions and (os.environ.get("JARVIS_BRAIN", "1") == "0" or os.environ.get("DISPATCH_NESTED")):
+    print("nomatch no sessions"); sys.exit(1)
+if sessions and re.match(LEAD + r"(?:(?:list|show|name)(?: me)?(?: all| the| my)* sessions?|(?:what|which)(?: are the)? sessions?(?: are)?(?: there| open| active| running)?|what(?:'s| is) open)\b", low):
+    names = [spoken(k) for k in sorted(sessions)]
+    print("list %d | %s%s" % (len(names), ", ".join(names), (" | focus " + spoken(focus)) if focus else "")); sys.exit()
+
+target, body, addressed, switch, ask = None, text, False, False, False
+m = re.match(LEAD + r"(?:switch|change|go|move)(?: over)? to (?:the )?(.*)$|" + LEAD + r"(?:use|select|focus(?: on)?|pick) (?:the )?(.*)$", text, flags=re.I)
+if m:
+    switch, addressed = True, True
+    target, body = take_name(m.group(1) or m.group(2))
+elif re.match(LEAD + r"(all|every) (sessions?|of you)\b", low):
+    target, body = "*", re.sub(LEAD + r"(all|every) (sessions?|of you)[ ,:]*", "", text, flags=re.I)
+else:
+    m = re.match(LEAD + r"(?:for|on|in|to) (?:the )?(.+?) (?:session|one)\b[ ,:]*(.*)$", text, flags=re.I)
+    if m: addressed, target, body = True, match(m.group(1)), m.group(2)
+    else:
+        m = re.match(LEAD + r"(?:tell|ask|session) (?:the )?(.*)$", text, flags=re.I)
+        if m: addressed, (target, body) = True, take_name(m.group(1))
+        else:
+            bare = re.sub(LEAD, "", text, flags=re.I)
+            k, rem = take_name(bare)   # just a session name: switch to it
+            if k and not re.sub(r"[^a-z]", "", rem.lower()): switch, addressed, target, body = True, True, k, ""
+            elif k and re.match(r"^[^,:]*[,:]", bare) and take_name(re.split(r"[,:]", bare, 1)[0])[0] == k \
+                    and not re.sub(r"[^a-z]", "", take_name(re.split(r"[,:]", bare, 1)[0])[1].lower()):
+                addressed, target, body = True, k, rem                # "<name>, <request>"
+if target is None and not addressed and os.environ.get("JARVIS_BRAIN", "1") != "0" and not os.environ.get("DISPATCH_NESTED"):
+    # no fixed phrase matched: ask the local brain whether this is for a session or a question for Jarvis itself
+    r = subprocess.run([os.path.join(here, "brain"), text], capture_output=True, text=True)
+    try: decision = json.loads(r.stdout) if r.returncode == 0 else {}
+    except ValueError: decision = {}
+    act = decision.get("action")
+    # a session command the fixed phrases missed: say it the canonical way and dispatch that (searches, folder
+    # matching and the spoken confirmation then work exactly as for the fixed phrases)
+    canon = None
+    folders = project_dirs(distro)
+    is_folder = lambda w: bool(w) and best_dir(w, folders) is not None
+    if act in ("past", "resume") and decision.get("project") and not is_folder(decision["project"]):
+        # a "project" that is no folder is what the session was about: "that thing I did on the flaky tests"
+        decision = {"action": "resume", "query": " ".join(filter(None, [decision.get("query", "").replace("last", ""), decision["project"]])).strip(), "project": ""}
+        act = "resume"
+    if act == "open" and not decision.get("project") and is_folder(decision.get("name", "")):
+        decision["project"], decision["name"] = decision["name"], ""          # "a fresh console for mobile app"
+    if act == "past":
+        canon = "list the old sessions" + (f" in {decision['project']}" if decision.get("project") else "")
+    elif act == "resume" and (decision.get("query") or decision.get("project")):
+        canon = f"resume {decision.get('query') or 'the last session'}" + (f" in {decision['project']}" if decision.get("project") else "")
+    elif act == "open":
+        canon = "start a session" + (f" in {decision['project']}" if decision.get("project") else "") + \
+                (f" called {decision['name']}" if decision.get("name") else "") + (f" and ask it to {decision['request']}" if decision.get("request") else "")
+    elif act == "close" and decision.get("session"):
+        canon = f"close the {decision['session']} session"
+    if canon:
+        r = subprocess.run([os.path.join(here, "dispatch")] + (["--text"] if mode == "dry" else []) + [canon],
+                           capture_output=True, text=True, env=os.environ | {"DISPATCH_NESTED": "1"})
+        sys.stdout.write(r.stdout); sys.exit(r.returncode)
+    if not sessions: print("nomatch no sessions"); sys.exit(1)
+    if act == "answer" and decision.get("text"):
+        print("answer | " + decision["text"].replace("|", ",").replace("\n", " ")); sys.exit()
+    if act == "escalate":
+        bkey = open(brain_path).read().strip() if os.path.exists(brain_path) else ""
+        if bkey not in sessions:
+            print("answer | I can't answer that one here. Type slash speak jarvis in a Claude session to give me a Claude brain."); sys.exit()
+        target, addressed = bkey, True
+        body = "Question for Jarvis from the user (spoken; answer in one to three short sentences, it will be read aloud): " + text
+        ask = True
+    elif act == "route" and decision.get("session"):
+        # only a session the sentence actually names: a guess ("what information? …" sent to webshop) would hand a
+        # follow-up meant for Jarvis to some other session, so an unnamed one goes on to the brain below
+        k = match(decision["session"])
+        target = k if k and mentioned(k) else focus or None
+if target is None and not addressed: target = focus or None
+if target is None and not switch and mode != "state":
+    # no session found (none named, nothing focused, or "tell me …" naming none): with a Claude brain (/speak jarvis)
+    # it goes there instead of "which session?"; an explicit "switch to <unknown>" still asks
+    bkey = open(brain_path).read().strip() if os.path.exists(brain_path) else ""
+    if bkey in sessions:
+        target, addressed, ask = bkey, True, True
+        body = "Request for Jarvis from the user (spoken; they named no session, so it is yours to answer or to hand to " \
+               "the right session; answer in one to three short sentences, it will be read aloud): " + text
+body = body.strip().strip(",. ") if body else ""
+if target is None: print("nomatch which session"); sys.exit(1)
+if switch and not body:
+    if mode == "send": open(focus_path, "w").write(target)
+    print("focus " + spoken(target)); sys.exit()
+if not body: print("nomatch empty request"); sys.exit(1)
+targets = list(sessions) if target == "*" else [target]
+label = ("broadcast %d" % len(targets)) if target == "*" else \
+    ("ask " if ask else "focus " if switch else "sent ") + spoken(target)
+if mode == "dry": print(label, "|", body); sys.exit()
+def deliver(key):
+    d = sessions[key]
+    if d.get("tmux"):
+        base = ["tmux", "send-keys", "-t", "=" + d["tmux"] + ":"]
+        # --exec: plain `wsl.exe -- cmd args` re-joins the arguments through a shell, splitting the request text
+        pre = [] if d["distro"] == distro else ["wsl.exe", "-d", d["distro"], "--cd", "/", "--exec"]
+        r1 = subprocess.run(pre + base + ["-l", "--", body], capture_output=True)
+        r2 = subprocess.run(pre + base + ["Enter"], capture_output=True)
+        return r1.returncode == 0 and r2.returncode == 0
+    try:
+        with open(os.path.join(inbox, key + ".msg"), "a") as f: f.write(body + "\n")
+        return True
+    except OSError: return False
+ok = [k for k in targets if deliver(k)]
+if target != "*" and os.environ.get("VOICE_FOLLOWUP") == "1":   # opt-in: after the reply, "anything else for X?"
+    os.makedirs(os.path.join(os.path.dirname(inbox), "awaiting"), exist_ok=True)
+    for k in ok: open(os.path.join(os.path.dirname(inbox), "awaiting", k), "w").close()
+if not ok: print("nomatch delivery failed"); sys.exit(1)
+def waiting(key):   # is the session's inbox hook running (it starts when a turn ends)? only knowable for this distro
+    d = sessions[key]
+    if d.get("tmux") or d.get("distro") != distro: return True
+    try: os.kill(int(open(os.path.expanduser(f"~/.claude/voice/sessions/.{d['session_id']}.waiter")).read().strip()), 0); return True
+    except (OSError, ValueError): return False
+queued = target != "*" and mode == "send" and not waiting(target)
+if target != "*" and not label.startswith("ask "): open(focus_path, "w").write(target)   # asking the brain keeps the focus
+print(label, "|", body + (" | queued" if queued else ""))
+PY

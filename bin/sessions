@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# List voice-addressable sessions (every distro) with liveness and Claude's status; forgets entries whose Claude
+# (pid, for /speak on sessions) or tmux session (claude-session) is gone.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+agents=$(claude agents --json 2>/dev/null || echo '[]')
+python3 - "$VOICE_SHARED/sessions" "$DISTRO" "$VOICE_HOME/focus" "$agents" <<'PY'
+import glob, json, os, subprocess, sys
+reg, distro, focus_path, agents = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+status = {a.get("sessionId"): a.get("status", "") for a in agents}
+focus = open(focus_path).read().strip() if os.path.exists(focus_path) else ""
+_running = None
+def running():
+    global _running
+    if _running is None:
+        if os.environ.get("PLATFORM") != "wsl": _running = {distro}; return _running   # one machine, no distros
+        r = subprocess.run(["wsl.exe", "-l", "--running", "-q"], capture_output=True)
+        _running = set(r.stdout.decode("utf-16-le", "ignore").replace("\r", "").split()) | {distro}
+    return _running
+rows = []
+for p in sorted(glob.glob(os.path.join(reg, "*.json"))):
+    d = json.load(open(p)); key = os.path.basename(p)[:-5]
+    local = d.get("distro") == distro
+    if not local and d.get("distro") not in running():
+        os.remove(p); continue                               # that distro is stopped (wsl --shutdown): its Claude is gone
+    # --exec, not --: wsl.exe would pass the command through a shell again and lose the sh -c arguments (every remote
+    # session then looked dead and was deleted)
+    pre = [] if local else ["wsl.exe", "-d", d["distro"], "--cd", "/", "--exec"]
+    # pid alone is not enough: pids get reused, so the pid's Claude session file must still name this session
+    check = ["tmux", "has-session", "-t", "=" + d["tmux"]] if d.get("tmux") else \
+        ["sh", "-c", 'kill -0 "$0" 2>/dev/null && grep -qs "$1" "$HOME/.claude/sessions/$0.json"', str(d.get("pid")), d.get("session_id", "")]
+    alive = subprocess.run(pre + check, capture_output=True).returncode == 0
+    if not alive:
+        os.remove(p); continue
+    rows.append((key, d["name"], d["distro"], status.get(d.get("session_id")) or d.get("status") or "?", "*" if key == focus else ""))
+if not rows: print("no voice sessions; type /speak on in a Claude Code session"); sys.exit()
+for key, name, dist, st, f in rows: print(f"{f:1} {name:24} {dist:16} {st}")
+PY

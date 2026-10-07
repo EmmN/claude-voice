@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Read text aloud. Usage: say "text" | say -f file | echo text | say
+# Engine: piper (local neural TTS, ~/.local/share/piper), played by `play`; without piper the system voice (macOS
+# `say`, Windows SAPI on WSL, espeak elsewhere). One voice at a time: a flock on VOICE_LOCK (on WSL a Windows-side
+# file shared by every distro).
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+VOICE="${SAY_VOICE:-$HOME/.local/share/piper/en_US-lessac-medium.onnx}"
+SPEED="${SAY_SPEED:-1.0}"
+STATE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/say"; mkdir -p "$STATE_DIR"
+LOCK="$VOICE_LOCK"
+
+if [ "${1:-}" = "-f" ]; then text=$(cat "$2")
+elif [ $# -gt 0 ]; then text="$*"
+else text=$(cat); fi
+text=$(printf '%s\n' "$text" | "$HERE/strip-markdown")
+[ -z "$text" ] && exit 0
+MAX="${SAY_MAX_CHARS:-2400}"   # about 400 words, two to three minutes
+[ "${#text}" -gt "$MAX" ] && text="${text:0:$MAX}. That is the short version; the rest is on screen."
+
+T0=$(now_ns)
+# The stop file is touched to cut speech (the Windows player and `play` watch it); its content says why. "stop"
+# (`voice stop`) drops this reply, also while it is still queued. "wake" / "barge" (you started talking to Jarvis)
+# only pause it: it is played again from the start once the conversation has let go of the lock.
+STOP="${LOCK%.lock}.stop"
+stop_since() { [ -f "$STOP" ] && newer_or_equal "$(mtime_ns "$STOP")" "$1"; }
+stop_kind() { cat "$STOP" 2>/dev/null; }
+system_voice() {   # only without piper; PowerShell can take 15 s to start on WSL
+  case "$PLATFORM" in
+    mac) /usr/bin/say "$text" ;;
+    wsl) esc=${text//\'/\'\'}; powershell.exe -NoProfile -Command "Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('$esc')" >/dev/null 2>&1 ;;
+    *)   command -v espeak >/dev/null && espeak "$text" ;;
+  esac
+}
+wav="$STATE_DIR/say-$$.wav"; trap 'rm -f "$wav"' EXIT
+# synthesize before queueing for the lock, so a queued reply starts the moment the previous one ends
+if ! { command -v piper >/dev/null && [ -s "$VOICE" ] && printf '%s' "$text" | piper -m "$VOICE" --length-scale "$SPEED" -f "$wav" >/dev/null 2>&1; }; then
+  wav=""   # no piper: the system voice, as the last resort
+fi
+# replies play a bit quieter (VOICE_REPLY_VOLUME, 0.6): the microphone then hears "hey Jarvis" over them more easily
+vol="${VOICE_REPLY_VOLUME:-0.6}"
+if [ -n "$wav" ] && [ "$vol" != 1 ] && [ "$vol" != 1.0 ]; then
+  ffmpeg -nostdin -hide_banner -loglevel error -i "$wav" -filter:a "volume=$vol" -y "$wav.v.wav" && mv -f "$wav.v.wav" "$wav"
+fi
+speech_log "say: synthesized ${#text} chars, waiting for the lock"
+exec 9>"$LOCK" 2>/dev/null || exec 9>"${TMPDIR:-/tmp}/claude-voice.lock"
+LISTENING="$VOICE_SHARED/listening"   # the listener's mark while you talk to Jarvis
+listening() { [ -f "$LISTENING" ] && [ $(( $(date +%s) - $(mtime "$LISTENING") )) -lt 120 ]; }
+# a pause between two replies (VOICE_REPLY_GAP seconds), so you can tell them apart and say "hey Jarvis" in between;
+# the waiting reply lets go of the lock meanwhile, so a conversation you start in the gap goes first
+LAST_END="$VOICE_SHARED/last_reply_end"
+gap_left() { [ -f "$LAST_END" ] && awk -v e="$(mtime_ns "$LAST_END")" -v n="$(now_ns)" -v g="${VOICE_REPLY_GAP:-5}" 'BEGIN { r = e + g - n; if (r > 0) { printf "%.1f", r; exit 0 } exit 1 }'; }
+attempt=0
+while [ "$attempt" -lt 3 ]; do
+  # wait for the lock: a conversation with Jarvis holds it, and a reply must not talk over you (3 min, then anyway)
+  flock -w "${SAY_LOCK_WAIT:-180}" 9
+  # right after "hey Jarvis" interrupts a reply, the next queued one could grab the lock before the listener does:
+  # while the listener's mark is there, step back and let the conversation go first
+  if listening; then flock -u 9; sleep 0.5; continue; fi
+  if left=$(gap_left); then flock -u 9; sleep "$left"; continue; fi
+  attempt=$((attempt + 1))
+  speech_log "say: got the lock"
+  stop_since "$T0" && [ "$(stop_kind)" = stop ] && { speech_log "say: dropped (stop)"; exit 0; }
+  [ -z "$wav" ] && { system_voice; exit 0; }
+  start=$(now_ns)
+  printf '%s' "$text" > "$VOICE_SHARED/speaking" 2>/dev/null   # the listener checks it for the wake word
+  "$HERE/play" "$wav"
+  rm -f "$VOICE_SHARED/speaking"   # per platform: the Windows-side player / WSLg, afplay, PulseAudio (at VOICE_REPLY_VOLUME)
+  if stop_since "$start" && [ "$(stop_kind)" != stop ]; then
+    speech_log "say: interrupted ($(stop_kind)); replaying after the conversation"
+    flock -u 9; sleep 1; continue
+  fi
+  : > "$LAST_END"; speech_log "say: played"; exit 0
+done

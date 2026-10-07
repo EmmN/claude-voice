@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Install the voice stack for Claude Code on this machine (WSL distro, macOS or Linux): tools, Piper voice, listener venv, ~/.local/bin links,
+# the /speak skill in ~/.claude/skills and the hooks in ~/.claude/settings.json. Idempotent; install.sh calls it.
+# `setup --no-listener` (what `claude-voice register` runs) skips the listener's Whisper/CUDA environment: enough for a
+# distro whose sessions should speak and take voice requests while the listener runs in another distro.
+set -euo pipefail
+LISTENER=1; [ "${1:-}" = "--no-listener" ] && LISTENER=0
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+. "$HERE/lib.sh"   # PLATFORM, the shared folder and lock, and on macOS Homebrew's GNU tools on PATH
+VOICE_DIR="$HOME/.local/share/piper"; MODEL="en_US-lessac-medium"
+mkdir -p "$HOME/.local/bin" "$VOICE_DIR" "$HOME/.claude/voice/sessions"
+
+echo "1/5 tools ($PLATFORM)"
+if [ "$PLATFORM" = mac ]; then need="ffmpeg flock jq python3 curl gstat gdate"; fix="brew install ffmpeg flock jq coreutils"
+else need="ffmpeg flock jq python3 curl sox"; fix="sudo apt install ffmpeg util-linux jq python3 curl sox libsox-fmt-pulse"; fi
+for t in $need; do command -v "$t" >/dev/null || { echo "missing $t; run: $fix"; exit 1; }; done
+[ "$PLATFORM" != wsl ] || [ -e /mnt/wslg/PulseServer ] || echo "warning: /mnt/wslg/PulseServer missing; WSLg audio not available, Windows SAPI fallback will be used"
+command -v uv >/dev/null || { echo "installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null; export PATH="$HOME/.local/bin:$PATH"; }
+command -v piper >/dev/null || { echo "installing piper-tts"; uv tool install piper-tts >/dev/null; }
+
+echo "2/5 voice model"; for f in "$MODEL.onnx" "$MODEL.onnx.json"; do
+  [ -s "$VOICE_DIR/$f" ] || curl -sSL -o "$VOICE_DIR/$f" "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/$f"; done
+
+if [ "$LISTENER" = 1 ]; then
+  echo "2b/5 listener environment (openWakeWord + Whisper)"
+  VENV="$HOME/.local/share/claude-voice/venv"
+  [ -x "$VENV/bin/python" ] || uv venv --python 3.12 "$VENV" >/dev/null
+  VIRTUAL_ENV="$VENV" uv pip install --quiet -r "$HERE/../requirements.txt"
+  if [ "$PLATFORM" != mac ] && { command -v nvidia-smi >/dev/null || [ -e /usr/lib/wsl/lib/nvidia-smi ]; }; then
+    echo "   NVIDIA GPU: CUDA libraries for Whisper"; VIRTUAL_ENV="$VENV" uv pip install --quiet -r "$HERE/../requirements-cuda.txt"
+  elif [ "$PLATFORM" = mac ] && [ "$(uname -m)" = arm64 ]; then
+    echo "   Apple Silicon: mlx-whisper (VOICE_WHISPER_BACKEND=mlx runs Whisper on the GPU)"
+    VIRTUAL_ENV="$VENV" uv pip install --quiet -r "$HERE/../requirements-mac.txt" || echo "   mlx-whisper failed to install; Whisper runs on the CPU"
+  fi
+else echo "2b/5 listener environment skipped (--no-listener)"; fi
+command -v tmux >/dev/null || echo "note: tmux missing; only the optional claude-session (tmux-hosted sessions) needs it"
+
+echo "3/5 commands in ~/.local/bin"; for s in say speechify voice strip-markdown claude-session claude-voice listen dispatch sessions mic-test; do ln -sfn "$HERE/$s" "$HOME/.local/bin/$s"; done
+ln -sfn "$HERE/hook-stop" "$HOME/.local/bin/claude-voice-hook-stop"
+ln -sfn "$HERE/hook-prompt" "$HOME/.local/bin/claude-voice-hook-prompt"
+ln -sfn "$HERE/hook-inbox" "$HOME/.local/bin/claude-voice-hook-inbox"
+ln -sfn "$HERE/hook-end" "$HOME/.local/bin/claude-voice-hook-end"
+ln -sfn "$HERE/hook-start" "$HOME/.local/bin/claude-voice-hook-start"
+ln -sfn "$HERE/session-open" "$HOME/.local/bin/session-open"
+ln -sfn "$HERE/session-close" "$HOME/.local/bin/session-close"
+ln -sfn "$HERE/recent-sessions" "$HOME/.local/bin/recent-sessions"
+ln -sfn "$HERE/play" "$HOME/.local/bin/play"
+ln -sfn "$HERE/brain" "$HOME/.local/bin/brain"
+
+if [ "$PLATFORM" = wsl ]; then echo "3a/5 Windows-side player (plays speech through Windows so the listener can keep the microphone open)"
+else echo "3a/5 Windows-side player: not needed on $PLATFORM"; fi
+if [ "$PLATFORM" = wsl ] && command -v powershell.exe >/dev/null; then
+  if ! cmp -s "$HERE/../windows/player.ps1" "$VOICE_SHARED/player.ps1"; then
+    cp "$HERE/../windows/player.ps1" "$VOICE_SHARED/player.ps1"
+    if player_alive; then touch "$VOICE_SHARED/player.quit"; for _ in $(seq 30); do player_alive || break; sleep 0.2; done; fi
+    rm -f "$VOICE_SHARED/player.starting" "$VOICE_SHARED/player.quit" "$VOICE_SHARED/player.alive"
+  fi
+  start_player || true
+  for _ in $(seq 40); do player_alive && break; sleep 0.5; done   # PowerShell can take 15 s to start
+  player_alive && echo "   player running" || echo "   player not up yet; speech uses WSLg audio until it is"
+elif [ "$PLATFORM" = wsl ]; then echo "   powershell.exe not reachable; speech uses WSLg audio"; fi
+echo "3b/5 /speak skill"; mkdir -p "$HOME/.claude/skills"; rm -rf "$HOME/.claude/skills/speak"; cp -r "$HERE/../skills/speak" "$HOME/.claude/skills/speak"
+
+echo "4/5 hooks in ~/.claude/settings.json"; "$HERE/register-hooks" "$HOME/.claude/settings.json"
+
+echo "5/5 smoke test"; printf 'Voice is installed on %s.' "$(hostname)" | "$HERE/say" && echo "   spoke OK"
+echo "Done. In any Claude Code session type /speak on (this session), /speak off, /speak status, /speak mute, /speak unmute."
+[ "$PLATFORM" = wsl ] && echo "Built-in dictation: /voice (hold to talk) now records through WSLg too."
+if [ "$LISTENER" = 1 ]; then echo "Hands-free: 'claude-voice start' runs the hey-Jarvis listener; /speak on in a session makes it addressable."
+else echo "Registered: /speak on in a session here makes it addressable by the listener running in another distro."; fi
+echo "Hooks load at session start: open /hooks once or start a new session."

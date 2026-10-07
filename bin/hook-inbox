@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook, registered with asyncRewake: while voice is on for this session, wait in the background for
+# a spoken request in the session's inbox (<VOICE_SHARED>/inbox/<distro>__<session_id>.msg, written by dispatch) and
+# hand it to Claude by printing it and exiting 2, which wakes the idle session with it. One waiter per session: a newer
+# waiter takes over the pid file and the older one exits. Ends quietly when voice goes off or Claude exits.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+input=$(cat)
+sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+[ -n "$sid" ] && [ -e "$VOICE_HOME/sessions/$sid" ] || exit 0
+box="$VOICE_INBOX/${DISTRO}__$sid"; pidf="$VOICE_HOME/sessions/.$sid.waiter"
+echo $$ > "$pidf"
+register_session "$sid" >/dev/null 2>&1
+cpid=$(jq -r '.pid // empty' "$VOICE_SHARED/sessions/${DISTRO}__$sid.json" 2>/dev/null)
+[ -n "$cpid" ] || exit 0   # Claude's session file not found: without its pid we could not tell when to stop waiting
+POLL="${VOICE_INBOX_POLL:-0.5}"
+while :; do
+  [ -e "$VOICE_HOME/sessions/$sid" ] || exit 0
+  [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] || exit 0
+  pid_alive "$cpid" || { unregister_session "$sid"; exit 0; }   # Claude went away without SessionEnd (crash, kill)
+  if [ -s "$box.msg" ] && mv "$box.msg" "$box.taken" 2>/dev/null; then
+    msg=$(cat "$box.taken"); rm -f "$box.taken" "$pidf"
+    # Claude Code shows this only as a collapsed hook line, so Claude is asked to echo the request first (hook-stop
+    # leaves that line out of the speech). The rest asks for a reply written to be heard, not read.
+    printf '%s\n\n%s\n' "Spoken request from the user (claude-voice dictation, transcribed by Whisper, so a word may be misheard). Treat it as if the user typed it. Begin your reply with one line, exactly: 🎤 You said: \"<the request below, verbatim>\" and then answer. Your answer will be read aloud by text-to-speech, so write it for listening: lead with the answer or outcome; plain spoken sentences; keep it short (a few sentences, unless the user asks for detail); no tables, bullet lists, headings, code blocks, file paths, URLs, commit hashes or ticket numbers in the spoken part (say 'the config file', 'the PR'); spell out what a symbol or abbreviation means when it matters; if you need the user to decide something, end with that question. You can still do all the work and edit files as usual; only the final message is spoken." "$msg" >&2
+    exit 2
+  fi
+  sleep "$POLL"
+done

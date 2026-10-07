@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# claude-voice — one front door for the voice stack.
+#   claude-voice start [session]   start the hey-Jarvis listener (and open/attach a voice session if a name is given)
+#   claude-voice stop              stop the listener, the Windows speech player and unload the brain model
+#   claude-voice status            listener, mute state, addressable sessions
+#   claude-voice register          set up this distro without the listener (hooks + speech) so /speak on works here
+#   claude-voice session <name>    start or re-attach a tmux-hosted voice session (alias of claude-session)
+#   claude-voice mic-test          record 5 s and play it back
+#   claude-voice config [KEY [VALUE]]  show or change settings (~/.claude/voice/config), e.g. VOICE_WAKE "hey claude"
+#   claude-voice log               follow the listener log
+#   claude-voice update            pull the latest claude-voice and re-run setup
+#   claude-voice home <dir>        create a private Jarvis home: CLAUDE.md template, config copy, git repo
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  start)
+    player_alive || start_player || true
+    if "$HERE/listen" --status | grep -q "^listener running"; then "$HERE/listen" --status
+    else "$HERE/listen" --daemon; sleep 2; "$HERE/listen" --status; fi
+    echo; "$HERE/sessions"
+    [ -n "${1:-}" ] && exec "$HERE/claude-session" "$1"
+    [ -z "$(ls "$VOICE_SHARED/sessions" 2>/dev/null)" ] && echo "tip: type /speak on in any Claude Code session to talk to it"
+    ;;
+  stop)     # everything Jarvis keeps running, so the laptop can idle: the listener (WSL), the Windows speech player
+            # and the brain's model on the GPU. Replies of sessions with voice on still play (the player starts again
+            # for them); `voice mute` silences those too. `claude-voice start` brings it all back.
+            "$HERE/listen" --stop
+            if player_alive; then touch "$VOICE_SHARED/player.quit"; echo "Windows speech player stopped"; fi
+            model="${JARVIS_MODEL:-${SPEECHIFY_MODEL:-gemma4:e4b}}"
+            if curl -s -m 5 "${OLLAMA_URL:-http://localhost:11434}/api/ps" 2>/dev/null | grep -q "\"$model\""; then
+              curl -s -m 10 "${OLLAMA_URL:-http://localhost:11434}/api/generate" -d "{\"model\":\"$model\",\"keep_alive\":0}" >/dev/null \
+                && echo "unloaded $model from the GPU"
+            fi;;
+  status)   "$HERE/listen" --status; "$HERE/voice" status; echo; "$HERE/sessions";;
+  register) exec "$HERE/setup" --no-listener;;
+  session)  exec "$HERE/claude-session" "$@";;
+  mic-test) exec "$HERE/mic-test";;
+  log)      exec tail -f "$VOICE_HOME/listen.log";;
+  config)   # KEY VALUE sets, KEY "" removes, KEY shows one, nothing lists all; the listener reads them when it starts
+            f="$VOICE_HOME/config"; touch "$f"
+            if [ $# -eq 0 ]; then [ -s "$f" ] && cat "$f" || echo "(no settings; defaults apply, see the README Tuning table)"; exit 0; fi
+            key=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9_')
+            if [ $# -eq 1 ]; then grep "^$key=" "$f" || echo "$key is not set"; exit 0; fi
+            grep -v "^$key=" "$f" > "$f.tmp" || true; [ -n "$2" ] && printf '%s=%s\n' "$key" "$2" >> "$f.tmp"; mv "$f.tmp" "$f"
+            [ -n "$2" ] && echo "$key=$2" || echo "$key removed"
+            if "$HERE/listen" --status | grep -q "^listener running"; then echo "restarting the listener"; "$HERE/listen" --stop >/dev/null; "$HERE/listen" --daemon; fi;;
+  home)     # a private folder for the brain session (/speak jarvis): your notes, mishearings, tools and config,
+            # kept out of this public repo. Never overwrites an existing CLAUDE.md.
+            dir="${1:-}"; [ -n "$dir" ] || { echo "usage: claude-voice home <dir>"; exit 2; }
+            mkdir -p "$dir/config" && dir=$(cd "$dir" && pwd)
+            [ -e "$dir/CLAUDE.md" ] && echo "kept the existing $dir/CLAUDE.md" || cp "$HERE/../templates/home-CLAUDE.md" "$dir/CLAUDE.md"
+            [ -s "$VOICE_HOME/config" ] && cp "$VOICE_HOME/config" "$dir/config/voice.config"
+            [ -d "$dir/.git" ] || git -C "$dir" init -q
+            echo "Jarvis home ready in $dir"
+            echo "next: start a Claude session there and type /speak jarvis; to back it up privately:"
+            echo "  cd $dir && git add -A && git commit -m 'Jarvis home' && gh repo create <name> --private --source=. --push";;
+  update)   # an install is a plain mirror of GitHub's main: sync to it exactly (survives a rewritten history)
+            # (a dev link, ~/.claude-voice -> your checkout, only fast-forwards: never reset someone's working tree)
+            if [ -L "$HOME/.claude-voice" ]; then git -C "$HERE/.." pull -q --ff-only || exit 1
+            else git -C "$HERE/.." fetch -q origin && git -C "$HERE/.." reset -q --hard origin/main || exit 1; fi
+            if [ -x "$VOICE_VENV/bin/python" ]; then exec "$HERE/setup"; else exec "$HERE/setup" --no-listener; fi;;
+  help|-h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//';;
+  *) echo "unknown command: $cmd"; sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+esac

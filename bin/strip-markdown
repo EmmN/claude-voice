@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Turn a markdown reply into plain speakable text (stdin → stdout): the words as written, minus what does not work
+out loud. Code blocks, URLs, commit hashes and ticket numbers go; tables and lists become lines; paths are read as
+their file name; identifiers like SAY_LOCK_WAIT are read as words; "30 s" is read as "30 seconds"."""
+import re, sys
+t = sys.stdin.read()
+t = re.sub(r"```.*?```", " (code omitted) ", t, flags=re.S)
+t = re.sub(r"`([^`]*)`", r"\1", t)
+t = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", t)
+t = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", t)
+t = re.sub(r"https?://\S+?(?=[.,;:!?)]*(?:\s|$))", "the link", t)   # keep the sentence's own punctuation
+def table_row(m):   # a table row becomes one sentence; the |---|---| divider disappears
+    cells = [c.strip() for c in m.group(0).strip().strip("|").split("|") if c.strip() and not set(c.strip()) <= set("-: ")]
+    return ", ".join(cells) + "." if cells else ""
+t = re.sub(r"^\s*\|.*\|\s*$", table_row, t, flags=re.M)
+t = re.sub(r"^#{1,6}\s*", "", t, flags=re.M)
+t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)
+t = re.sub(r"^\s*\d+\.\s+", "", t, flags=re.M)
+t = re.sub(r"(\*\*|\*)(?=\S)(.+?)(?<=\S)\1", r"\2", t)                     # **bold**, *italic*
+t = re.sub(r"(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\1(?!\w)", r"\2", t)            # _italic_ (not snake_case)
+t = re.sub(r"\b(PR|pull request|issue|ticket|story|build)s?\s*#\d+", r"the \1", t, flags=re.I)
+t = re.sub(r"#\d+\b", "", t)
+t = re.sub(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b", "", t)  # commit hashes
+t = re.sub(r"(?<![\w/])(?:~|\.{1,2})?/?(?:[\w.@-]+/)+([\w.@-]+)", r"\1", t)  # paths → file name
+t = re.sub(r"(?<=[A-Za-z])_(?=[A-Za-z0-9])", " ", t)                        # snake_case → words
+t = re.sub(r"(\d)\s?ms\b", r"\1 milliseconds", t)
+t = re.sub(r"(\d)\s?s\b", r"\1 seconds", t)
+t = re.sub(r"[ \t]+", " ", t)
+t = re.sub(r" ([,.;:])", r"\1", t)
+t = re.sub(r"\n{2,}", "\n", t)
+print(t.strip())

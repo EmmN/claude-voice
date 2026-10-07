@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Turn a Claude reply into what is read aloud (stdin → stdout): by default the reply itself, cleaned for speech;
+# SPEECHIFY_MODE=summary retells it with the local ollama model instead.
+# No ids, PR numbers, URLs, file paths or code: those do not help when spoken. Falls back to markdown stripping
+# when ollama is down or slow, so the voice never goes silent because of the rewrite.
+set -uo pipefail
+MODEL="${SPEECHIFY_MODEL:-gemma4:e4b}"   # dev/bench-models: best summaries and routing of the models that fit an 8 GB card
+MAX_WORDS="${SPEECHIFY_MAX_WORDS:-200}"
+TIMEOUT="${SPEECHIFY_TIMEOUT:-25}"
+MIN_CHARS="${SPEECHIFY_MIN_CHARS:-350}"
+RETRY="${SPEECHIFY_RETRY:-60}"
+CTX="${VOICE_NUM_CTX:-4096}"   # same as bin/brain: one model, one context size, no reloads; small enough to stay in VRAM   # after a failed call, skip ollama for this many seconds instead of waiting on it again
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+. "$HERE/lib.sh"
+DOWN="$VOICE_HOME/ollama_down"
+input=$(cat)
+[ -z "$input" ] && exit 0
+recently_down() { [ -f "$DOWN" ] && [ $(( $(date +%s) - $(mtime "$DOWN") )) -lt "$RETRY" ]; }
+# read (default): the reply word for word, cleaned for speech by strip-markdown; instant and faithful.
+# summary: the ollama retelling below (keeps the points in order, drops what does not work out loud; ~25 s for 300
+# words on an 8 GB card, so only when you want it).
+if [ "${SPEECHIFY_MODE:-read}" != summary ] || [ "${#input}" -lt "$MIN_CHARS" ] || [ "${SPEECHIFY_DISABLE:-0}" = "1" ] || recently_down; then
+  printf '%s\n' "$input" | "$HERE/strip-markdown"; exit 0
+fi
+prompt="You retell a written software-engineering reply so it can be read aloud, in at most $MAX_WORDS words.
+Keep everything the reply says: every point, result, decision, number that matters, warning and question, in the same
+order and in the same first-person voice. Do not summarize away content and do not add anything. Only change what does
+not work out loud: turn tables and lists into plain sentences, describe code in words instead of reading it, and drop
+pull request and ticket numbers, commit hashes, URLs and file paths (say 'the PR', 'the story', 'the config file').
+If the reply is longer than $MAX_WORDS words, keep the most important points first. Plain spoken English, no markdown.
+Output only the spoken text.
+
+Reply:
+$input"
+raw=$(jq -cn --arg m "$MODEL" --arg p "$prompt" --argjson c "$CTX" --argjson w "$MAX_WORDS" '{model:$m, prompt:$p, stream:false, think:false, keep_alive:"30m", options:{temperature:0.2, num_predict:($w * 2), num_ctx:$c}}' \
+  | timeout "$TIMEOUT" curl -sS -f -m "$TIMEOUT" "${OLLAMA_URL:-http://localhost:11434}/api/generate" -d @- 2>/dev/null)
+if [ $? -ne 0 ]; then touch "$DOWN"; else rm -f "$DOWN"; fi
+speech_log "speechify: ollama answered"
+out=$(printf '%s' "$raw" | jq -r '.response // empty' 2>/dev/null | sed -E 's/<think>.*<\/think>//g' | tr -s '\n' ' ' \
+  | sed -E 's/\b(PR|pull request|build|story|ticket|issue|commit)s? #[0-9]+/the \1/Ig; s/#[0-9]+//g; s/https?:\/\/[^ ]+/the link/g; s/  +/ /g; s/^ +| +$//g')
+if [ -n "$out" ] && [ "${#out}" -gt 20 ]; then printf '%s\n' "$out"; else printf '%s\n' "$input" | "$HERE/strip-markdown"; fi

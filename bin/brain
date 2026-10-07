@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Jarvis's local brain: decide what a spoken sentence is for with the local ollama model, in structured JSON.
+# Usage: brain "<transcript>" → one JSON line. Session commands the fixed phrases missed: {"action":"past"|"resume"|
+# "open"|"close", …} (dispatch turns them into its canonical sentences). Otherwise: {"action":"route","session":"<name or empty>"} (a request for a Claude
+# session; empty = the focused one), {"action":"answer","text":"…"} (a question for Jarvis itself, answered from what
+# the registry knows: names, distros, folders, busy/idle, last prompt and reply), or {"action":"escalate"} (a general
+# question to pass to Jarvis's Claude brain, see `voice jarvis`). Exits 1 when ollama is down or slow, and dispatch
+# then falls back to the focused session. `brain --warm` loads the model and keeps it loaded (the listener calls it).
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+MODEL="${JARVIS_MODEL:-${SPEECHIFY_MODEL:-gemma4:e4b}}"; KEEP="${JARVIS_KEEP_ALIVE:-30m}"
+TIMEOUT="${JARVIS_TIMEOUT:-8}"; URL="${OLLAMA_URL:-http://localhost:11434}"
+CTX="${VOICE_NUM_CTX:-4096}"   # small context: the model then fits in VRAM next to Whisper (same value as speechify, or ollama reloads)
+if [ "${1:-}" = "--warm" ]; then
+  jq -cn --arg m "$MODEL" --arg k "$KEEP" --argjson c "$CTX" '{model:$m, keep_alive:$k, options:{num_ctx:$c}}' | curl -sS -m 60 "$URL/api/generate" -d @- >/dev/null 2>&1; exit 0
+fi
+text="${*:-}"; [ -n "$text" ] || exit 1
+python3 - "$VOICE_SHARED/sessions" "$VOICE_HOME/focus" "$VOICE_SHARED/jarvis_brain" "$MODEL" "$KEEP" "$TIMEOUT" "$URL" "$text" "$CTX" <<'PY'
+import glob, json, os, re, sys, time, urllib.request
+reg, focus_path, brain_path, model, keep, timeout, url, text, ctx = sys.argv[1:10]
+def read(p):
+    try: return open(p).read().strip()
+    except OSError: return ""
+focus, brain = read(focus_path), read(brain_path)
+now, facts = time.time(), []
+for p in sorted(glob.glob(os.path.join(reg, "*.json"))):
+    try: d = json.load(open(p))
+    except Exception: continue
+    key = os.path.basename(p)[:-5]
+    age = int((now - d.get("updated", d.get("registered", now))) / 60)
+    line = f"- session \"{d['name'].replace('_', ' ').replace('-', ' ')}\" (project folder {os.path.basename(d.get('cwd', '')) or '?'}, distro {d.get('distro')}): " \
+           f"{d.get('status', 'idle')} (last change {age} min ago)"
+    if key == focus: line += ", FOCUSED"
+    if key == brain: line += ", Jarvis's Claude brain"
+    if d.get("last_prompt"): line += f"; last asked: {d['last_prompt'][:150]!r}"
+    if d.get("last_reply"): line += f"; last replied: {d['last_reply'][:250]!r}"
+    facts.append(line)
+general = ('{"action":"escalate"} only for general-knowledge questions that have nothing to do with the sessions or their projects '
+           "(Jarvis's Claude brain answers those).") if brain else \
+          ('general-knowledge questions that have nothing to do with the sessions or their projects: answer them yourself in one or two sentences.')
+system = f"""You are Jarvis, the voice front end for the user's Claude Code sessions. Classify what the user just said and reply with only a JSON object, no other text.
+
+{{"action":"answer","text":"<one or two spoken sentences>"}} ONLY for questions about the set of sessions as a whole, answerable from the facts below: how many sessions are open, which ones, which is busy, idle or focused, the time, or a greeting or thanks. Plain words; always call a session by its quoted session name, never by its project folder.
+{{"action":"route","session":"<session name the user named, or empty for the focused session>"}} for EVERYTHING ELSE that a Claude Code session could do or know: tasks, code, files, tests, commits, tickets, deploys, what a session did or is doing, summaries of its work, how its project works, questions about a project such as claude voice. The session knows its own work far better than you do: never answer those yourself.
+{{"action":"past","project":"<project folder words or empty>"}} when the user wants to hear their earlier / old / previous Claude sessions (in a project).
+{{"action":"resume","query":"<words of the session's title>","project":"<project or empty>"}} when the user wants to reopen, resume, continue or go back to an earlier session; "query" is what the session was about ("last" for the most recent one).
+{{"action":"open","project":"<project folder words or empty>","name":"<name or empty>","request":"<first request or empty>"}} ONLY when the user explicitly asks for a NEW, fresh Claude session (a new terminal or console). Anything that points back at earlier work ("what was I doing about …", "the conversation where we …", "that thing I did …", "open the one about …") is "resume", not "open".
+{{"action":"close","session":"<session name>"}} when the user wants to close, end, stop or quit one of the open sessions.
+{general}
+If in doubt, route.
+
+Examples:
+"how many sessions are open" -> {{"action":"answer","text":"Two sessions are open: claude voice and db upgrade."}}
+"which one is busy" -> {{"action":"answer","text":"db upgrade is busy; claude voice is idle."}}
+"give me a summary of what was done in that session" -> {{"action":"route","session":""}}
+"what is db upgrade working on" -> {{"action":"route","session":"db upgrade"}}
+"how does claude voice work" -> {{"action":"route","session":"claude voice"}}
+"who does the summarization in claude voice" -> {{"action":"route","session":"claude voice"}}
+"run the tests and fix what fails" -> {{"action":"route","session":""}}
+"good morning" -> {{"action":"answer","text":"Good morning."}}
+"what can you do" -> {{"action":"answer","text":"I send what you say to your Claude sessions, answer questions about them, and can start, resume or close sessions."}}
+"what was I working on in webshop before" -> {{"action":"past","project":"webshop"}}
+"pull up that thing I did on the flaky tests yesterday" -> {{"action":"resume","query":"flaky tests","project":""}}
+"get me back into the last teamhub deploy conversation" -> {{"action":"resume","query":"last","project":"teamhub deploy"}}
+"fire up a new one for the widgets repo and have it run the tests" -> {{"action":"open","project":"widgets","name":"","request":"run the tests"}}
+"I'm done with the db upgrade one, shut it" -> {{"action":"close","session":"db upgrade"}}
+"what was I doing about webhook retries" -> {{"action":"resume","query":"webhook retries","project":""}}
+"open the conversation where we fixed the login bug" -> {{"action":"resume","query":"login bug","project":""}}
+"start a new claude console" -> {{"action":"open","project":"","name":"","request":""}}
+
+Facts (local time {time.strftime('%A %H:%M')}):
+{chr(10).join(facts) or '- no sessions are registered'}"""
+# no "format" schema: with think=false qwen3.5 ignores it in ollama, and thinking costs seconds; the prompt asks for JSON
+body = json.dumps({"model": model, "stream": False, "think": False, "keep_alive": keep,
+                   "options": {"temperature": 0, "num_predict": 120, "num_ctx": int(ctx)},
+                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}]}).encode()
+try:
+    r = urllib.request.urlopen(urllib.request.Request(url + "/api/chat", body, {"Content-Type": "application/json"}), timeout=float(timeout))
+    content = json.loads(r.read())["message"]["content"]
+    out = json.loads(content[content.index("{"):content.rindex("}") + 1])
+    assert out.get("action") in ("route", "answer", "escalate", "past", "resume", "open", "close")
+    if out["action"] == "answer" and re.search(r"\b(rout|forward|pass(ing)? (it|this|your)|send(ing)? (it|this|your))", out.get("text", ""), re.I):
+        out = {"action": "route", "session": ""}   # it answered "I'll route that": do it
+except Exception:
+    sys.exit(1)
+print(json.dumps(out))
+PY

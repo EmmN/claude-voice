@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Past Claude Code sessions on this machine, newest first, as one JSON line each:
+#   {"id", "title", "project", "cwd", "mtime", "open", "distro", "score"}
+# Usage: recent-sessions [--query "flaky tests"] [--project webshop] [--limit 5] [--all-distros]
+#        recent-sessions --top-projects 3   → {"cwd", "project", "count"}: folders with the most sessions in 30 days
+# The title is the /rename name when there is one, else the title Claude Code gave the session (ai-title). A query
+# ranks every session by how well its title (and project) matches the words, fuzzily, so a misheard word still finds
+# it; without a query the newest come first. "open" is true when a live Claude is on that session right now.
+# --all-distros (WSL) also asks every other distro that has claude-voice installed.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+query="" project="" limit=5 all=0 top=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --query) query="$2"; shift 2;; --project) project="$2"; shift 2;; --limit) limit="$2"; shift 2;;
+    --all-distros) all=1; shift;; --top-projects) top="$2"; shift 2;; *) echo "unknown option $1" >&2; exit 2;;
+  esac
+done
+P="$HOME/.claude/projects"
+shopt -s nullglob; files=("$P"/*/*.jsonl); shopt -u nullglob
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+{
+  # one pass of grep each (fast even over gigabytes): titles, then each file's first cwd
+  [ ${#files[@]} -gt 0 ] && grep -H -o -E '"type":"(custom-title|ai-title)","(customTitle|aiTitle)":"[^"]*"' "${files[@]}" | sed 's/^/T\t/'
+  [ ${#files[@]} -gt 0 ] && grep -H -m1 -o -E '"cwd":"[^"]*"' "${files[@]}" | sed 's/^/C\t/'
+} 2>/dev/null > "$tmp"
+python3 - "$query" "$project" "$limit" "$DISTRO" "$tmp" "$top" <<'PY'
+import difflib, glob, json, os, re, sys, time
+query, project, limit, distro, data, top = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], int(sys.argv[6])
+custom, ai, cwd = {}, {}, {}
+for line in open(data, errors="replace"):
+    kind, rest = line.rstrip("\n").split("\t", 1)
+    path, _, payload = rest.partition(":")
+    if kind == "T":
+        m = re.search(r'"(customTitle|aiTitle)":"([^"]*)"', payload)
+        if m: (custom if m.group(1) == "customTitle" else ai)[path] = m.group(2)   # the last one wins
+    else:
+        m = re.search(r'"cwd":"([^"]*)"', payload)
+        if m: cwd[path] = m.group(1)
+if top:   # the folders you work in most: sessions per folder over the last 30 days (still existing folders only)
+    count = {}
+    for path, folder in cwd.items():
+        try:
+            if time.time() - os.path.getmtime(path) < 30 * 86400 and os.path.isdir(folder): count[folder] = count.get(folder, 0) + 1
+        except OSError: pass
+    for folder, n in sorted(count.items(), key=lambda kv: -kv[1])[:top]:
+        print(json.dumps({"cwd": folder, "project": os.path.basename(folder), "count": n, "distro": distro}))
+    sys.exit()
+live = set()
+for p in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try:
+        d = json.load(open(p)); os.kill(int(d["pid"]), 0); live.add(d.get("sessionId"))
+    except Exception: pass
+def words(s): return re.sub(r"[^a-z0-9 ]", " ", re.sub(r"([a-z])([A-Z])", r"\1 \2", s).lower().replace("_", " ").replace("-", " ")).split()
+want = [w for w in words(query) if w not in {"the", "a", "an", "session", "sessions", "about", "on", "with", "for", "my", "old", "previous"}]
+rows = []
+for path in set(custom) | set(ai):
+    title = custom.get(path) or ai.get(path); folder = cwd.get(path, "")
+    # "web shop" (as Whisper writes it) must find webshop: compare words, and also with the spaces removed
+    if project and not (set(words(project)) <= set(words(os.path.basename(folder))) | set(words(folder))
+                        or "".join(words(project)) == "".join(words(os.path.basename(folder)))): continue
+    try: mtime = os.path.getmtime(path)
+    except OSError: continue
+    score = 0.0
+    if want:
+        have = words(title) + words(os.path.basename(folder))
+        for w in want:   # each wanted word: its best fuzzy match in the title (0..1)
+            score += max((difflib.SequenceMatcher(None, w, h).ratio() for h in have), default=0)
+        score /= len(want)
+        score -= 0.01 * len(set(words(title)) - set(want))   # "flaky tests" prefers flaky_tests to flaky_tests_review
+    rows.append({"id": os.path.basename(path)[:-6], "title": title, "project": os.path.basename(folder), "cwd": folder,
+                 "mtime": int(mtime), "open": os.path.basename(path)[:-6] in live, "distro": distro, "score": round(score, 3)})
+rows.sort(key=lambda r: (-r["score"], -r["mtime"]) if want else (-r["mtime"],))
+for r in rows[:limit]: print(json.dumps(r))
+PY
+if [ "$all" = 1 ] && [ "$PLATFORM" = wsl ]; then
+  for d in $(wsl.exe -l -q 2>/dev/null | tr -d '\0\r'); do
+    [ "$d" = "$DISTRO" ] && continue
+    timeout 30 wsl.exe -d "$d" --cd / --exec bash -lc 'command -v recent-sessions >/dev/null && recent-sessions "$@"' _ \
+      --query "$query" --project "$project" --limit "$limit" 2>/dev/null | tr -d '\r'
+  done
+fi

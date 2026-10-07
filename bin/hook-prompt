@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Claude Code UserPromptSubmit hook. Remembers which session prompted last (so `voice on` without an id works) and
+# handles `/speak on|off|status|mute|unmute` (not /voice, which is Claude Code's own dictation) typed by the user, answering through systemMessage.
+set -uo pipefail
+DIR="$HOME/.claude/voice"; mkdir -p "$DIR/sessions"
+input=$(cat)
+sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+prompt=$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null)
+[ -n "$sid" ] && printf '%s' "$sid" > "$DIR/current_session"
+# keep this session's voice registry entry current: the name (a /rename changes it), busy, and what it was asked
+# (Jarvis's local brain answers "what is X doing?" from this)
+if [ -n "$sid" ] && [ -e "$DIR/sessions/$sid" ]; then
+  . "$(dirname "$(readlink -f "$0")")/lib.sh"
+  register_session "$sid" status=busy "last_prompt=$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-300)" >/dev/null 2>&1
+fi
+case "$prompt" in
+  /speak*) sub=$(printf '%s' "$prompt" | awk '{print $2}'); arg=$(printf '%s' "$prompt" | awk '{print $3}')
+           if [ "$sub" = jarvis ]; then msg=$("$(dirname "$(readlink -f "$0")")/voice" jarvis "${arg:-on}" "$sid" 2>&1 | tr '\n' ' ')
+           else msg=$("$(dirname "$(readlink -f "$0")")/voice" "${sub:-status}" "$sid" 2>&1 | tr '\n' ' '); fi
+           # systemMessage is shown to the user only; additionalContext is what the /speak skill (the model) sees
+           jq -cn --arg m "$msg" '{systemMessage:$m, hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:("claude-voice hook result: " + $m)}}';;
+esac
+exit 0

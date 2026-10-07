@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook: when voice is on for this session (and the machine is not muted), speak a spoken-summary
+# version of the assistant's final message. Detaches immediately so the hook never delays the turn.
+set -uo pipefail
+DIR="$HOME/.claude/voice"; HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+input=$(cat); speech_log "hook-stop start"
+sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
+[ -n "$sid" ] && [ -e "$DIR/sessions/$sid" ] || exit 0
+# The reply itself comes in the hook input (last_assistant_message). The transcript is only a fallback: when the hook
+# fires, Claude Code may not have written the final message to it yet, and reading it then speaks the previous reply.
+text=$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null | head -c 8000)
+transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)
+if [ -z "$text" ] && [ -s "$transcript" ]; then
+text=$(python3 - "$transcript" <<'PY'
+import json, sys
+last = None
+for line in open(sys.argv[1], encoding="utf-8", errors="ignore"):
+    try: d = json.loads(line)
+    except Exception: continue
+    if d.get("type") != "assistant": continue
+    parts = [c.get("text", "") for c in ((d.get("message") or {}).get("content") or []) if isinstance(c, dict) and c.get("type") == "text"]
+    if parts: last = "\n".join(parts)
+print((last or "")[:8000])
+PY
+)
+fi
+text=$(printf '%s\n' "$text" | grep -vE '^[[:space:]>*_`"]*🎤')   # the echoed voice request is for the screen, not the speakers
+[ -z "$text" ] && exit 0
+register_session "$sid" status=idle "last_reply=$(printf '%s' "$text" | "$HERE/strip-markdown" | tr '\n' ' ' | sed 's/ *$//' | cut -c1-600)" >/dev/null 2>&1
+name=$(session_name_for_id "$sid" | tr '_-' '  ')
+prefix=""; [ -n "$name" ] && [ "$(ls "$DIR/sessions" | wc -l)" -gt 1 ] && prefix="From $name: "
+fname="$name"   # for the follow-up question
+[ "$(cat "$VOICE_SHARED/jarvis_brain" 2>/dev/null)" = "${DISTRO}__$sid" ] && prefix="" fname=""   # Jarvis's Claude brain speaks as Jarvis
+awaiting="$VOICE_SHARED/awaiting/${DISTRO}__$sid"   # dispatch's mark: this turn answered a spoken request
+[ -e "$DIR/muted" ] && { rm -f "$awaiting"; exit 0; }   # muted: status is recorded above, nothing is spoken
+# after reading the reply of a spoken request, write <shared>/followup: the listener then asks "anything else for X?"
+speech_log "hook-stop: reply read ($(printf '%s' "$text" | wc -c) chars), summarizing"
+nohup bash -c "{ printf '%s' \"\$2\"; printf '%s' \"\$1\" | '$HERE/speechify'; } | '$HERE/say'
+  if [ -e \"\$3\" ]; then rm -f \"\$3\"; printf '%s' \"\$5\" > \"\$4\"; fi" _ "$text" "$prefix" "$awaiting" "$VOICE_SHARED/followup" "$fname" >/dev/null 2>&1 &
+exit 0

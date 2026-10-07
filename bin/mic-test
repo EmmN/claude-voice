@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Record 5 s from the microphone, report the level and play it back. Speak while it records.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+out="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/mic-test.wav"
+args=(); while IFS= read -r a; do args+=("$a"); done < <(mic_input_args)
+echo "recording 5 s from ${args[*]} — speak now"
+case "$PLATFORM" in
+  wsl) hint="is WSLg running (ls /mnt/wslg/PulseServer)?";;
+  mac) hint="allow the microphone for your terminal app: System Settings → Privacy & Security → Microphone; list devices with: ffmpeg -f avfoundation -list_devices true -i \"\"";;
+  *)   hint="is PulseAudio/PipeWire running (pactl info)?";;
+esac
+ffmpeg -hide_banner -loglevel error "${args[@]}" -t 5 -ac 1 -ar 16000 -y "$out" || { echo "capture failed; $hint"; exit 1; }
+python3 - "$out" "$PLATFORM" <<'PY'
+import wave, struct, math, sys
+w = wave.open(sys.argv[1]); n = w.getnframes(); s = struct.unpack("<%dh" % n, w.readframes(n))
+rms = math.sqrt(sum(x * x for x in s) / max(1, n)); peak = max(abs(x) for x in s)
+print(f"rms={rms:.0f} peak={peak}")
+if peak < 200:
+    print("looks like SILENCE: " + ("check Windows Settings → Privacy & security → Microphone (desktop apps on), and the default input device"
+                                     if sys.argv[2] == "wsl" else "check the microphone permission for your terminal and VOICE_MIC"))
+else: print("microphone is live")
+PY
+echo "playing back"; "$HERE/play" "$out"

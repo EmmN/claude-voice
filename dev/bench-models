@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Benchmark ollama models on Jarvis's two jobs, through the real scripts.
+
+  dev/bench-models qwen3.5:9b gemma4:e4b …
+
+brain:     bin/brain on labelled sentences against a fixture registry (three sessions in two distros) → accuracy of
+           route / answer / escalate (and the routed session), warm latency.
+speechify: bin/speechify on three written replies → warm latency, length, leaked ids/paths/URLs; outputs are printed
+           so a human can judge how they sound.
+Each model is loaded once first (load time reported separately) and unloaded afterwards, so models do not share VRAM.
+Stop the listener first (`claude-voice stop`): it keeps its own model warm.
+"""
+import json, os, re, statistics, subprocess, sys, tempfile, time, urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = os.path.join(ROOT, "bin")
+URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+SESSIONS = {
+    "Ubuntu-24.04__s1": {"name": "claude-voice-d5", "distro": "Ubuntu-24.04", "session_id": "s1", "cwd": "/home/u/projects/claude-voice",
+                         "status": "busy", "last_prompt": "add a follow-up question after spoken replies",
+                         "last_reply": "I added the follow-up: after a reply to a spoken request Jarvis asks anything else."},
+    "Ubuntu-24.04__s2": {"name": "db_upgrade", "distro": "Ubuntu-24.04", "session_id": "s2", "cwd": "/home/u/projects/infra",
+                         "status": "idle", "last_prompt": "check the replication lag on the replica",
+                         "last_reply": "Replication lag is under one second on both replicas; the upgrade can go ahead."},
+    "Debian__s3": {"name": "shop-2a", "distro": "Debian", "session_id": "s3",
+                                 "cwd": "/home/u/projects/shop", "status": "idle",
+                                 "last_prompt": "list the open stories", "last_reply": "There are four open stories; two are ready to close."},
+}
+# (sentence, expected action, expected session words or None)
+CASES = [
+    ("How many sessions are open?", "answer", None),
+    ("Which session is busy right now?", "answer", None),
+    ("Is db upgrade idle?", "answer", None),
+    ("What time is it?", "answer", None),
+    ("Good morning Jarvis.", "answer", None),
+    ("Thanks, that's helpful.", "answer", None),
+    ("Run the tests and fix whatever fails.", "route", ""),
+    ("Commit the changes and push.", "route", ""),
+    ("Give me a summary of what was done in that session.", "route", ""),
+    ("How does Claude Voice work?", "route", "claude voice"),
+    ("Who does the summarization in claude voice?", "route", "claude voice"),
+    ("What is db upgrade working on?", "route", "db upgrade"),
+    ("Have the shop one close the stories that are done.", "route", "shop"),
+    ("Check whether the replica in db upgrade is still lagging.", "route", "db upgrade"),
+    ("Why did the last deploy fail?", "route", ""),
+    ("Open a pull request for this branch.", "route", ""),
+    ("Explain how the speech lock works in this project.", "route", ""),
+    ("If you are running, give me more information about how Claude Voice works.", "route", "claude voice"),
+    ("Summarize the open stories in shop.", "route", "shop"),
+    ("What did db upgrade find about the lag?", "route", "db upgrade"),
+]
+REPLIES = [
+    "## Done\n\nI fixed the flaky test in `spec/models/booking_spec.rb` (PR #4123). The cause was a timezone assumption in "
+    "`Booking#starts_at`; it now uses `Time.zone`. All 312 specs pass. **Next:** should I also backport it to the `release-7.2` "
+    "branch? See https://github.com/acme/app/pull/4123 for the diff.",
+    "Here is the status:\n\n| Story | State |\n|---|---|\n| MT-881 checkout redesign | in review |\n| MT-902 refunds | blocked on "
+    "finance |\n| MT-915 invoice PDF | done |\n\nMT-902 is blocked because finance has not confirmed the refund rules; I "
+    "pinged them in the ticket. The other two need nothing from you.",
+    "I upgraded MySQL on the replica from 8.0.36 to 8.4.2 using `mysqlsh util.upgradeChecker` first. Replication caught up "
+    "in 40 seconds and lag is now under one second. The primary is next, but it needs a maintenance window of about ten "
+    "minutes; do you want me to schedule it for tonight at 23:00?",
+]
+
+def ollama(path, body, timeout=300):
+    req = urllib.request.Request(URL + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+
+def run(cmd, env, inp=None):
+    t = time.time()
+    r = subprocess.run(cmd, env=env, input=inp, capture_output=True, text=True)
+    return time.time() - t, r
+
+def bench(model, shared):
+    env = os.environ | {"JARVIS_MODEL": model, "SPEECHIFY_MODEL": model, "VOICE_SHARED": shared, "JARVIS_TIMEOUT": "60",
+                        "SPEECHIFY_TIMEOUT": "60", "SPEECHIFY_RETRY": "0", "SPEECHIFY_MIN_CHARS": "100", "VOICE_HOME": os.path.join(shared, "home")}
+    t = time.time(); ollama("/api/generate", {"model": model, "keep_alive": "10m"}); load = time.time() - t
+    run([os.path.join(BIN, "brain"), "hello"], env)                     # warm the prompt path once
+    ok, lat, misses = 0, [], []
+    for text, want, sess in CASES:
+        dt, r = run([os.path.join(BIN, "brain"), text], env); lat.append(dt)
+        try: d = json.loads(r.stdout)
+        except ValueError: d = {"action": "error"}
+        good = d.get("action") == want and (sess is None or not sess or sess in d.get("session", "").lower().replace("_", " ").replace("-", " "))
+        if want == "route" and sess == "" and d.get("action") == "route": good = True   # any route counts when the focus is fine
+        ok += good
+        if not good: misses.append(f"{text!r} → {d}")
+    sp = []
+    for reply in REPLIES:
+        dt, r = run([os.path.join(BIN, "speechify")], env, reply)
+        out = r.stdout.strip()
+        leaks = re.findall(r"#\d+|https?://|`|\.rb\b|\|", out)
+        sp.append((dt, len(out.split()), leaks, out))
+    ollama("/api/generate", {"model": model, "keep_alive": 0})
+    return {"model": model, "load": load, "acc": ok / len(CASES), "brain_p50": statistics.median(lat), "brain_max": max(lat),
+            "misses": misses, "speech": sp}
+
+def main():
+    models = sys.argv[1:] or ["qwen3.5:9b"]
+    shared = tempfile.mkdtemp(prefix="bench-")
+    os.makedirs(os.path.join(shared, "sessions")); os.makedirs(os.path.join(shared, "home"))
+    for k, d in SESSIONS.items(): json.dump(d | {"updated": int(time.time()) - 120}, open(os.path.join(shared, "sessions", k + ".json"), "w"))
+    open(os.path.join(shared, "home", "focus"), "w").write("Ubuntu-24.04__s1")
+    rows = []
+    for m in models:
+        print(f"== {m}", flush=True)
+        try: res = bench(m, shared)
+        except Exception as e: print(f"   failed: {e}"); continue
+        rows.append(res)
+        print(f"   load {res['load']:.1f}s  brain {res['acc']*100:.0f}% p50 {res['brain_p50']:.2f}s max {res['brain_max']:.2f}s", flush=True)
+        for x in res["misses"]: print("   miss:", x)
+        for dt, words, leaks, out in res["speech"]:
+            print(f"   speech {dt:.2f}s {words}w leaks={leaks}: {out[:230]}")
+    print("\nmodel                  brain acc  brain p50  speech p50  load")
+    for r in sorted(rows, key=lambda r: (-r["acc"], r["brain_p50"])):
+        print(f"{r['model']:22} {r['acc']*100:8.0f}%  {r['brain_p50']:8.2f}s  {statistics.median(s[0] for s in r['speech']):9.2f}s  {r['load']:5.1f}s")
+
+if __name__ == "__main__":
+    main()

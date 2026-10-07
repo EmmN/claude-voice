@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Start the voice listener (foreground). `listen --daemon` detaches; `listen --stop` ends it. Other flags pass through
+# to listen.py (--from-wav FILE, --threshold 0.5, --wake hey_jarvis, --whisper small, --mic DEVICE, --no-ack).
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+PID="$VOICE_HOME/listen.pid"; LOG="$VOICE_HOME/listen.log"
+stop_all() {  # every listener of this install (identified by its lock file), not just the pid file's: a stray second
+  # listener fights over the lock. Listeners of another install (another VOICE_LOCK, e.g. the test suite) are left alone.
+  local pat pids sup p pp
+  pat="listen\.py --lock $(printf '%s' "$VOICE_LOCK" | sed 's/[][\.*^$+?(){}|/]/\\&/g')( |$)"
+  pids=$(pgrep -f "$pat" 2>/dev/null | tr '\n' ' ')
+  sup=""; [ -s "$PID" ] && sup="$(cat "$PID")"
+  for p in $pids; do            # their supervisors (the restart loop), so nothing comes back
+    pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); ps -o args= -p "$pp" 2>/dev/null | grep -q '^bash -c while :' && sup="$sup $pp"
+  done
+  for p in $sup; do kill "$p" 2>/dev/null; done
+  for p in $pids; do pkill -TERM -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done   # its microphone capture, then itself
+  [ -n "$pids" ] && sleep 1
+  for p in $pids; do kill -KILL "$p" 2>/dev/null; done                               # anything that ignored TERM
+  rm -f "$PID"; echo "listener stopped"
+}
+case "${1:-}" in
+  --stop) stop_all; exit 0;;
+  --status) if [ -s "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "listener running (pid $(cat "$PID")); log: $LOG"; else echo "listener not running"; fi; exit 0;;
+  --daemon) shift; stop_all >/dev/null   # one listener per machine: clear strays first
+            # keep the log small: past 5 MB it becomes listen.log.1 (the previous .1 is dropped)
+            if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "${VOICE_LOG_MAX:-5000000}" ]; then mv -f "$LOG" "$LOG.1"; fi
+            # supervised: if the listener exits or crashes it is started again after 3 s
+            nohup bash -c 'while :; do "$0" "$@"; rc=$?; echo "$(date "+%Y-%m-%d %H:%M:%S") ERROR listener exited ($rc); restarting in 3 s"; sleep 3; done' "$0" "$@" >>"$LOG" 2>&1 &
+            echo $! > "$PID"; sleep 1
+            if kill -0 "$(cat "$PID")" 2>/dev/null; then echo "listener started (pid $(cat "$PID")), log: $LOG"; else echo "listener failed to start:"; tail -5 "$LOG"; rm -f "$PID"; exit 1; fi; exit 0;;
+esac
+[ -x "$VOICE_VENV/bin/python" ] || { echo "voice venv missing; run bin/utils/voice/setup"; exit 1; }
+venv_python "$HERE/listen.py" --lock "$VOICE_LOCK" --shared "$VOICE_SHARED" "$@"

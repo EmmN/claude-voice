@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Register claude-voice's hooks in a Claude Code settings file: `register-hooks [~/.claude/settings.json]`.
+Idempotent: an existing entry for the same command (or the old claude-speak-last hook) is replaced, so re-running
+setup never duplicates hooks; every other hook and setting is kept. setup runs it; tests run it on a scratch file."""
+import json, os, sys
+p = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.claude/settings.json"); d = json.load(open(p)) if os.path.exists(p) else {}
+hooks = d.setdefault("hooks", {})
+def ensure(event, cmd, extra):
+    lst = hooks.setdefault(event, [])
+    lst[:] = [e for e in lst if not any("claude-speak-last" in h.get("command", "") or cmd in h.get("command", "") for h in e.get("hooks", []))]
+    lst.append({"hooks": [dict(type="command", command=cmd, **extra)]})
+home = os.path.expanduser("~")
+ensure("Stop", f"{home}/.local/bin/claude-voice-hook-stop", {"timeout": 10, "async": True, "statusMessage": "Speaking"})
+# asyncRewake: runs in the background after each turn and wakes the session when it exits 2 (a spoken request arrived)
+ensure("Stop", f"{home}/.local/bin/claude-voice-hook-inbox", {"timeout": 86400, "asyncRewake": True, "rewakeSummary": "🎤 Voice request (Jarvis)"})
+ensure("SessionEnd", f"{home}/.local/bin/claude-voice-hook-end", {"timeout": 5})
+# sessions opened by Jarvis (session-open sets CLAUDE_VOICE_AUTO=1) get voice on at their start
+ensure("SessionStart", f"{home}/.local/bin/claude-voice-hook-start", {"timeout": 5})
+ensure("UserPromptSubmit", f"{home}/.local/bin/claude-voice-hook-prompt", {"timeout": 5})
+os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+with open(p, "w") as f: json.dump(d, f, indent=2)
+print("   hooks registered")

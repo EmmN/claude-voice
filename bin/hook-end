@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Claude Code SessionEnd hook: the session is closing (exit, /clear, logout), so forget it for voice: drop its shared
+# registry entry, pending inbox, waiter marker and voice flag. `/speak on` again after `claude --resume` or `/clear`.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+sid=$(jq -r '.session_id // empty' 2>/dev/null)
+[ -n "$sid" ] && unregister_session "$sid"
+exit 0

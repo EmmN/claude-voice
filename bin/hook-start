@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Claude Code SessionStart hook: a session opened by session-open (CLAUDE_VOICE_AUTO=1 in its environment) gets voice
+# on from the start, as if you had typed /speak on: replies spoken, registered for Jarvis, focused. Claude may not have
+# written its own session file yet, so the registration is retried in the background for a few seconds.
+set -uo pipefail
+[ "${CLAUDE_VOICE_AUTO:-}" = 1 ] || exit 0
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+sid=$(jq -r '.session_id // empty' 2>/dev/null)
+[ -n "$sid" ] || exit 0
+: > "$VOICE_HOME/sessions/$sid"
+nohup bash -c 'for _ in $(seq 20); do "$0" on "$1" >/dev/null 2>&1 && [ -f "$2" ] && exit 0; sleep 0.5; done' \
+  "$HERE/voice" "$sid" "$VOICE_SHARED/sessions/${DISTRO}__$sid.json" >/dev/null 2>&1 &
+jq -cn '{systemMessage: "claude-voice: voice on (opened by Jarvis)"}'
+exit 0

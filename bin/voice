@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Per-session voice control. Usage: voice on|off|status|mute|unmute [session_id] | voice jarvis on|off | voice stop | voice sessions | voice focus <name> | voice listen …
+#   on/off/status act on one Claude Code session (id from $1, else the most recent prompt in this distro).
+#   mute/unmute silence every session on this machine (~/.claude/voice/muted).
+set -uo pipefail
+DIR="$HOME/.claude/voice"; mkdir -p "$DIR/sessions"
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+cmd="${1:-status}"; sid="${2:-}"
+[ -z "$sid" ] && [ -s "$DIR/current_session" ] && sid=$(cat "$DIR/current_session")
+case "$cmd" in
+  on)     [ -n "$sid" ] || { echo "no session id known yet; send one prompt first"; exit 1; }; : > "$DIR/sessions/$sid"
+          . "$HERE/lib.sh"
+          if name=$(register_session "$sid"); then printf '%s' "${DISTRO}__$sid" > "$DIR/focus"; echo "voice ON for session $name ($sid); say \"${VOICE_WAKE:-hey claude}\" to talk to it"
+          else echo "voice ON for session $sid"; fi;;
+  off)    [ -n "$sid" ] || { echo "no session id known yet"; exit 1; }; . "$HERE/lib.sh"; unregister_session "$sid"; echo "voice OFF for session $sid";;
+  jarvis) # voice jarvis on|off [sid]: this session becomes (or stops being) Jarvis's Claude brain, which gets the
+          # questions the local model passes up; $2 is on/off here, so the session id is $3
+          . "$HERE/lib.sh"; sid="${3:-$(cat "$DIR/current_session" 2>/dev/null)}"; [ -n "$sid" ] || { echo "no session id known yet"; exit 1; }
+          if [ "${2:-on}" = off ]; then rm -f "$VOICE_SHARED/jarvis_brain"; echo "Jarvis is back to its local brain only"
+          else "$0" on "$sid" >/dev/null; printf '%s' "${DISTRO}__$sid" > "$VOICE_SHARED/jarvis_brain"
+               echo "this session ($(session_name_for_id "$sid")) is now Jarvis's brain: questions Jarvis cannot answer locally come here; /speak jarvis off to undo"; fi;;
+  stop)   . "$HERE/lib.sh"; printf stop > "${VOICE_LOCK%.lock}.stop"; echo "stopped speaking (and skipped queued replies)";;
+  mute)   : > "$DIR/muted"; echo "voice muted on this machine";;
+  unmute) rm -f "$DIR/muted"; echo "voice unmuted";;
+  status) [ -e "$DIR/muted" ] && echo "machine: MUTED" || echo "machine: unmuted"
+          if [ -n "$sid" ]; then [ -e "$DIR/sessions/$sid" ] && echo "session $sid: ON" || echo "session $sid: off"; fi
+          n=$(ls "$DIR/sessions" 2>/dev/null | wc -l); echo "sessions with voice on: $n"
+          . "$HERE/lib.sh"; b=$(cat "$VOICE_SHARED/jarvis_brain" 2>/dev/null); echo "Jarvis's Claude brain: ${b:-none (local model only)}";;
+  sessions) exec "$(dirname "$(readlink -f "$0")")/sessions";;
+  focus)  key=$(ls "$HOME/.claude/voice/../voice" >/dev/null 2>&1; . "$(dirname "$(readlink -f "$0")")/lib.sh"; ls "$VOICE_SHARED/sessions" | sed 's/\.json$//' | grep -i -- "${sid:-}" | head -1)
+          [ -n "$key" ] && { printf '%s' "$key" > "$DIR/focus"; echo "focus: $key"; } || { echo "no voice session matching '${sid:-}'"; exit 1; };;
+  listen) shift; exec "$(dirname "$(readlink -f "$0")")/listen" "$@";;
+  mic-test) exec "$(dirname "$(readlink -f "$0")")/mic-test";;
+  *) echo "usage: voice on|off|status|mute|unmute [session_id] | jarvis on|off | stop | sessions | focus <name> | listen [--daemon|--stop|--status] | mic-test"; exit 2;;
+esac

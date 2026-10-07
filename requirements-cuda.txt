@@ -1,0 +1,3 @@
+# NVIDIA libraries for faster-whisper on the GPU; setup installs them on Linux/WSL when an NVIDIA GPU is present
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

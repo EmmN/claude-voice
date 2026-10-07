@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Open a new Claude Code session in a visible terminal tab, with voice on from its first turn.
+# Usage: session-open <dir> <name> [first request] [--distro <wsl distro>] [--resume <session id>] [--dry-run]
+#   --resume reopens that past conversation (claude --resume <id>) instead of starting a new one
+#   wsl:   a new Windows Terminal tab (wt.exe) running wsl.exe -d <distro> (this distro by default)
+#   mac:   a new Terminal window (osascript)
+#   linux: x-terminal-emulator / gnome-terminal / konsole
+# The tab runs `claude -n <name> [request]` in <dir> with CLAUDE_VOICE_AUTO=1, which hook-start turns into
+# `/speak on`. The session gets your normal Claude Code settings and permissions, exactly like typing `claude` there.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
+dir="" name="" request="" target="$DISTRO" dry=0 resume=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --distro) target="$2"; shift 2;;
+    --resume) resume="$2"; shift 2;;
+    --dry-run) dry=1; shift;;
+    *) if [ -z "$dir" ]; then dir="$1"; elif [ -z "$name" ]; then name="$1"; else request="$1"; fi; shift;;
+  esac
+done
+[ -n "$dir" ] && [ -n "$name" ] || { echo "usage: session-open <dir> <name> [first request] [--distro D]"; exit 2; }
+name=$(printf '%s' "$name" | tr 'A-Z ' 'a-z_' | tr -cd 'a-z0-9_-')
+
+# The launch script lives in the shared folder so that a tab in another distro can read it; it deletes itself.
+mkdir -p "$VOICE_SHARED/launch"
+launch="$VOICE_SHARED/launch/$(date +%s)-$$.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo '# sourced by an interactive login shell in the new tab (so your shell setup applies); deletes itself'
+  printf 'cd %q || { echo "claude-voice: no such folder: %s"; sleep 10; exit 1; }\n' "$dir" "$dir"
+  printf 'rm -f -- %q\n' "$launch"
+  echo 'export CLAUDE_VOICE_AUTO=1'
+  claude_cmd="${CLAUDE_VOICE_CLAUDE:-claude}"   # tests point this at a stand-in
+  # Always start with a turn: the inbox hook that takes spoken requests starts when a turn ends, so a session that
+  # just sat there (resumed, or new without a request) would never receive anything Jarvis sends it.
+  ready="(claude-voice) This session was just opened by voice. Reply with one short sentence saying you are ready; nothing else."
+  [ -n "$resume" ] && ready="(claude-voice) This session was just resumed by voice. In one or two short sentences, say where we left off; nothing else."
+  if [ -n "$resume" ]; then printf 'exec %s --resume %q %q\n' "$claude_cmd" "$resume" "${request:-$ready}"   # keeps its name and history
+  else printf 'exec %s -n %q %q\n' "$claude_cmd" "$name" "${request:-$ready}"; fi
+} > "$launch"
+speech_log "session-open: $name in $dir ($target)"
+[ "$dry" = 1 ] && { echo "would open: $(tr '\n' ' ' < "$launch")"; rm -f "$launch"; exit 0; }
+
+case "$PLATFORM" in
+  wsl)
+    # no ';' in the arguments: wt.exe treats it as a command separator
+    # an interactive login shell, like a tab you open yourself: ~/.bashrc runs (nvm and the node tools it puts on PATH,
+    # rvm, your cd hooks), and the launch script is sourced in it so its `cd` triggers them too
+    wt.exe -w 0 new-tab --title "$name" wsl.exe -d "$target" --cd / -- bash -lic ". $launch" >/dev/null 2>&1 &
+    ;;
+  mac)
+    osascript -e "tell application \"Terminal\" to do script \"${SHELL:-/bin/zsh} -lic '. $launch'\"" -e 'tell application "Terminal" to activate' >/dev/null ;;
+  *)
+    for t in x-terminal-emulator gnome-terminal konsole xterm; do
+      command -v "$t" >/dev/null || continue
+      case "$t" in gnome-terminal) "$t" -- bash -lic ". $launch" & ;; *) "$t" -e bash -lic ". $launch" & ;; esac
+      break
+    done ;;
+esac
+echo "opening $name in $dir"

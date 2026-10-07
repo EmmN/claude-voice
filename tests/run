@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the test suite: tests/run [pattern]   e.g. tests/run test_dispatch
+# Offline and isolated: a throwaway HOME per test, platform forced to linux, the local brain off; no audio, no
+# microphone, no ollama, nothing in your real ~/.claude or Windows folder is touched. Needs python3 (+ numpy), jq.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+exec python3 -m unittest discover -s . -p "${1:-test_*}.py" -v

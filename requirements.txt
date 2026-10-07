@@ -1,0 +1,3 @@
+openwakeword
+faster-whisper
+numpy
