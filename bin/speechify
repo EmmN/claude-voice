@@ -32,7 +32,7 @@ Output only the spoken text.
 
 Reply:
 $input"
-raw=$(jq -cn --arg m "$MODEL" --arg p "$prompt" --argjson c "$CTX" --argjson w "$MAX_WORDS" '{model:$m, prompt:$p, stream:false, think:false, keep_alive:"30m", options:{temperature:0.2, num_predict:($w * 2), num_ctx:$c}}' \
+raw=$(jq -cn --arg m "$MODEL" --arg p "$prompt" --argjson c "$CTX" --argjson w "$MAX_WORDS" '{model:$m, prompt:$p, stream:false, think:false, keep_alive:"5m", options:{temperature:0.2, num_predict:($w * 2), num_ctx:$c}}' \
   | timeout "$TIMEOUT" curl -sS -f -m "$TIMEOUT" "${OLLAMA_URL:-http://localhost:11434}/api/generate" -d @- 2>/dev/null)
 if [ $? -ne 0 ]; then touch "$DOWN"; else rm -f "$DOWN"; fi
 speech_log "speechify: ollama answered"

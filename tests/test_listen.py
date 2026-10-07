@@ -89,8 +89,12 @@ class SpeechDetection(unittest.TestCase):
         audio = listen.record_request(src, noise_floor=10, wait=3)
         self.assertGreater(len(audio), FRAME * 10)
 
-    def test_nobody_answers(self):
-        self.assertEqual(len(listen.record_request(FakeSource([0] * 60), noise_floor=10, wait=2)), 0)
+    def test_nobody_answers(self):   # a quiet room still has a little noise (level 30)
+        self.assertEqual(len(listen.record_request(FakeSource([30] * 60), noise_floor=10, wait=2)), 0)
+
+    def test_a_dead_microphone_is_reported(self):   # digital silence: the capture died, not you silent
+        with self.assertRaises(listen.MicDead):
+            listen.record_request(FakeSource([0] * 60), noise_floor=10, wait=4)
 
     def test_still_talking_after_the_wake_word(self):
         talking, _ = listen.keeps_talking(FakeSource([600] * 20), noise_floor=10)

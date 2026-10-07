@@ -93,7 +93,7 @@ def ai_pick(kind, phrase, options):
            f"or split differently). Which of these {kind}s do they mean?\n{listing}\n"
            'Reply with only a JSON object: {"index": <number>} for the best match, or {"index": -1} if none fits.')
     body = json.dumps({"model": os.environ.get("JARVIS_MODEL") or os.environ.get("SPEECHIFY_MODEL") or "gemma4:e4b",
-                       "stream": False, "think": False, "keep_alive": os.environ.get("JARVIS_KEEP_ALIVE", "30m"),
+                       "stream": False, "think": False, "keep_alive": os.environ.get("JARVIS_KEEP_ALIVE", "5m"),
                        "options": {"temperature": 0, "num_predict": 20, "num_ctx": int(os.environ.get("VOICE_NUM_CTX", "4096"))},
                        "messages": [{"role": "user", "content": ask}]}).encode()
     try:

@@ -8,7 +8,7 @@
 # then falls back to the focused session. `brain --warm` loads the model and keeps it loaded (the listener calls it).
 set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"; . "$HERE/lib.sh"
-MODEL="${JARVIS_MODEL:-${SPEECHIFY_MODEL:-gemma4:e4b}}"; KEEP="${JARVIS_KEEP_ALIVE:-30m}"
+MODEL="${JARVIS_MODEL:-${SPEECHIFY_MODEL:-gemma4:e4b}}"; KEEP="${JARVIS_KEEP_ALIVE:-5m}"   # the model leaves the GPU 5 minutes after the last use (battery)
 TIMEOUT="${JARVIS_TIMEOUT:-8}"; URL="${OLLAMA_URL:-http://localhost:11434}"
 CTX="${VOICE_NUM_CTX:-4096}"   # small context: the model then fits in VRAM next to Whisper (same value as speechify, or ollama reloads)
 if [ "${1:-}" = "--warm" ]; then

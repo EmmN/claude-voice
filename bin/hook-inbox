@@ -13,10 +13,10 @@ echo $$ > "$pidf"
 register_session "$sid" >/dev/null 2>&1
 cpid=$(jq -r '.pid // empty' "$VOICE_SHARED/sessions/${DISTRO}__$sid.json" 2>/dev/null)
 [ -n "$cpid" ] || exit 0   # Claude's session file not found: without its pid we could not tell when to stop waiting
-POLL="${VOICE_INBOX_POLL:-0.5}"
+POLL="${VOICE_INBOX_POLL:-1}"   # one check a second per waiting session, with shell builtins only (battery)
 while :; do
   [ -e "$VOICE_HOME/sessions/$sid" ] || exit 0
-  [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] || exit 0
+  cur=""; read -r cur < "$pidf" 2>/dev/null; [ "$cur" = "$$" ] || exit 0
   pid_alive "$cpid" || { unregister_session "$sid"; exit 0; }   # Claude went away without SessionEnd (crash, kill)
   if [ -s "$box.msg" ] && mv "$box.msg" "$box.taken" 2>/dev/null; then
     msg=$(cat "$box.taken"); rm -f "$box.taken" "$pidf"

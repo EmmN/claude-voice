@@ -369,12 +369,12 @@ for audio, which goes through PulseAudio.
 | `VOICE_REPLY_VOLUME` | `0.6` | volume of session replies (Jarvis's own prompts stay at full volume); quieter replies let "hey Jarvis" through |
 | `VOICE_WHISPER_MODEL`, `VOICE_WHISPER_DEVICE` | `small`, `cuda` | dictation model and device |
 | `VOICE_MIC` | `RDPSource` | PulseAudio source |
-| `VOICE_INBOX_POLL` | `0.5` | seconds between inbox checks in a waiting session |
+| `VOICE_INBOX_POLL` | `1` | seconds between inbox checks in a waiting session |
 | `SAY_SPEED` | `1.0` | Piper length scale; lower is faster |
 | `SAY_VOICE` | `~/.local/share/piper/en_US-lessac-medium.onnx` | another Piper voice |
 | `SPEECHIFY_MODEL` | `gemma4:e4b` | ollama model for the summary (see `dev/bench-models`) |
 | `JARVIS_MODEL` | `SPEECHIFY_MODEL` | ollama model for the local brain; one model for both avoids swapping on an 8 GB card |
-| `JARVIS_TIMEOUT`, `JARVIS_KEEP_ALIVE` | `8`, `30m` | give up on the brain after this many seconds; how long ollama keeps the model loaded |
+| `JARVIS_TIMEOUT`, `JARVIS_KEEP_ALIVE` | `8`, `5m` | give up on the brain after this many seconds; how long ollama keeps the model loaded |
 | `JARVIS_BRAIN=0` | | no local brain: unmatched sentences go straight to the focused session |
 | `SPEECHIFY_MODE` | `read` | `read`: the reply word for word, cleaned for speech (instant); `summary`: retold by the ollama model |
 | `SPEECHIFY_MAX_WORDS`, `SPEECHIFY_MIN_CHARS` | `200`, `350` | summary mode only: length of the retelling; shorter replies are read as is |
@@ -388,6 +388,8 @@ for audio, which goes through PulseAudio.
 | `VOICE_WHISPER_BACKEND` | `faster` | `mlx`: Whisper on the Apple Silicon GPU (mlx-whisper) |
 | `CLAUDE_VOICE_PLATFORM` | detected | force `wsl`, `mac` or `linux` |
 | `VOICE_PROJECTS` | `~/projects` | where "start a session in <project>" looks for the folder (colon-separated) |
+| `VOICE_DEAD_MIC_LEVEL` | `10` | while waiting for your answer, 2 s with nothing louder than this is a dead microphone: reopened, and you are asked again |
+| `VOICE_PLAYER_IDLE` | `600` | (Windows env) seconds the Windows speech player stays without a clip once no listener runs |
 | `VOICE_SHARED`, `VOICE_LOCK` | your Windows user folder | where the shared state lives |
 
 Set listener variables when starting it, e.g. `VOICE_SILENCE=3.5 claude-voice start`. GPU budget: Whisper `small`
@@ -421,12 +423,25 @@ carries on). ffmpeg's harmless WSLg timestamp warnings are summarized once an ho
 log rolls over to `listen.log.1` past 5 MB (`VOICE_LOG_MAX`). Spoken replies have their own step log in
 `~/.claude/voice/speech.log`.
 
+## Battery
+
+Nothing runs in the background until you start it. `claude-voice start` runs the listener (the wake-word model on the
+CPU, about 2 % of a core; Whisper resident on the GPU) and the Windows speech player; `claude-voice stop` ends both and
+unloads the brain's model from the GPU. Otherwise:
+
+- the Windows player starts only when something has to be said and quits after 10 idle minutes when no listener runs;
+- each voice-on session's inbox hook checks once a second with shell builtins only;
+- ollama drops the brain's model from the GPU 5 minutes after its last use (`JARVIS_KEEP_ALIVE`);
+- the "hey claude" phrase wake runs Whisper on every burst of speech in the room (noise is skipped by the voice
+  detector); a bundled openWakeWord model (`claude-voice config VOICE_WAKE hey_jarvis`) is the lighter choice.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | "Hey Claude" then nothing, you have to call it twice | `claude-voice log`: `no speech for 8 s (loudest …, threshold …)` shows whether your voice stayed under the threshold (raise your voice or lower the capped threshold) or nobody spoke in time (`VOICE_FIRST_WAIT`) |
 | "Hey Jarvis" is hard to get through while a reply plays | the speakers' echo is louder than your voice (`prompt echo … max` in the log). Lower `VOICE_REPLY_VOLUME` or `VOICE_WAKE_THRESHOLD_PLAYING`; `near miss during a reply` lines show how close it got |
+| you often have to say the wake word twice | `claude-voice log`: `microphone dead while listening` / `stalled` lines are the WSLg capture dropping out (it is reopened and you are asked again); `near miss: wake score` lines are wake words that almost made it (lower `VOICE_WAKE_THRESHOLD`, e.g. 0.45) |
 | "Hey Claude" does nothing | `claude-voice log`: no `wake` lines means the mic is silent. `voice mic-test`; if silent, `wsl --shutdown` in PowerShell (closes every distro) or check Windows microphone privacy |
 | speech breaks up every few words | it is playing through WSLg while something records: is the Windows player up? `ls -l C:\Users\<you>\.claude-voice\player.alive` must be seconds old; `claude-voice start` starts it |
 | clicks, stalls, a clip is missing | WSLg audio hiccup: playback gives up after the clip length + 5 s (`audio playback timed out` in the log). Persistent: `wsl --shutdown` |

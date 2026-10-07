@@ -229,7 +229,7 @@ class Source:
                 continue
             if self.paused or proc is not self.proc: continue      # closed on purpose
             log("microphone capture ended; reopening it")
-            proc.wait(); time.sleep(1)
+            proc.wait(); time.sleep(0.2)                       # short: you are deaf until it is back
             if not self.paused: self._open()
     def pause(self):
         if getattr(self, "wav", False): return
@@ -335,6 +335,11 @@ def keeps_talking(src, noise_floor, window=1.2):
     # no pause at all ("hey Jarvis how many…" in one go) but speech right up to the end of the window: still talking
     return any(is_voice(f, threshold) for f in frames[-4:]), frames
 
+DEAD_MIC = float(os.environ.get("VOICE_DEAD_MIC_LEVEL", "10"))   # a live mic never stays this quiet for 2 s
+
+class MicDead(Exception):
+    """The microphone delivered (near) digital silence while we waited for an answer: a stalled or broken capture."""
+
 def record_request(src, noise_floor, wait=None, prefix=None):
     """Record one answer: start counting once the level passes the speech threshold, stop after VOICE_SILENCE of
     quiet. Nobody speaking for `wait` seconds (default VOICE_WAIT) gives an empty recording; the levels are logged."""
@@ -351,6 +356,10 @@ def record_request(src, noise_floor, wait=None, prefix=None):
         if is_voice(f, threshold, level): speech_seen, silent = True, 0.0
         else: silent += FRAME / RATE
         if speech_seen and silent >= SILENCE_TO_STOP and heard() > MIN_SPEECH: break
+        if not speech_seen and heard() >= 2.0 and peak <= DEAD_MIC:
+            # 2 s without even room noise: the capture is dead (WSLg), not you silent; the caller reopens and asks again
+            log(f"microphone dead while listening (loudest {peak:.0f} in {heard():.1f} s)", "warn")
+            raise MicDead()
         if not speech_seen and silent >= wait:              # nobody answered
             log(f"no speech for {wait:.0f} s (loudest {peak:.0f}, threshold {threshold:.0f}, floor {noise_floor:.0f})")
             return np.zeros(0, dtype=np.int16)
@@ -392,6 +401,10 @@ class Jarvis:
         self.listening_mark = os.path.join(self.shared, "listening")
         self.request_sent = False
         self._speaking_mtime, self._speaking_has_wake = None, False
+
+    def heartbeat(self):
+        try: open(os.path.join(self.shared, "listener.alive"), "w").close()
+        except OSError: pass
 
     def reply_says_wake_word(self):
         """Does the session reply being played (say writes its text to <shared>/speaking) contain the wake word? Then
@@ -464,14 +477,15 @@ class Jarvis:
         timer = timer or Timer()
         said = speak(opening, interruptible=True) if opening else first_frames
         if opening: timer.mark("prompt")
-        picked = len(st["sessions"]) <= 1
+        picked, retried_empty = len(st["sessions"]) <= 1, False
         for turn in range(6):
             # the first answer comes after a list of sessions you may need a moment to think about
             if turn == 0 and first_text:   # "hey claude, <request>" in one breath, already transcribed: no recording
                 audio = None
             else:
-                audio = record_request(src, floor, wait=FIRST_WAIT if turn == 0 else None, prefix=said); said = None
+                audio = self.listen_answer(wait=FIRST_WAIT if turn == 0 else None, prefix=said); said = None
                 if oww: oww.reset()
+                if audio is None: return               # the microphone stayed dead and you were told
             timer.mark("listen")
             if audio is None:
                 text = first_text; first_text = None
@@ -486,7 +500,9 @@ class Jarvis:
                 if turn == 0 and strip:                  # the recording began with the wake phrase itself
                     text = strip_wake(text, WAKE_NAME[0])
             log(f"heard: {text}")
-            if not text: return
+            if not text.strip():                       # sound, but no words (echo, a cough): ask once, then let go
+                if retried_empty: return
+                retried_empty = True; said = speak("Sorry, say that again?", interruptible=True); continue
             if is_wake_fragment(text):                   # "Jarvis.", "jar": only the wake word again, no request
                 said = speak("Yes?", interruptible=True); continue
             env = os.environ | ({} if picked else {"VOICE_NO_FOCUS": "1"})
@@ -510,7 +526,8 @@ class Jarvis:
                 info = json.loads(parts[1]); top = [t["project"].replace("-", " ").replace("_", " ") for t in info["top"]]
                 q = f"Which project? Most used: {spoken_list(top).replace(' and ', ' or ')}. Or name any other folder." if top else "In which project?"
                 said = speak(q, interruptible=True)
-                audio = record_request(src, floor, wait=FIRST_WAIT, prefix=said)
+                audio = self.listen_answer(wait=FIRST_WAIT, prefix=said)
+                if audio is None: return
                 if len(audio) < RATE * 0.4: speak("OK, no new session."); return
                 self.beep(); answer = transcribe(audio.astype(np.float32) / 32768.0, "Projects: " + ", ".join(top) + ".")
                 log(f"project: {answer!r}")
@@ -525,7 +542,8 @@ class Jarvis:
                 lines = [f"{['One', 'Two', 'Three', 'Four', 'Five'][i]}, {humanize(it['title'])}, in {it['project'].replace('-', ' ')}, {when(it['mtime'])}"
                          + (", already open" if it.get("open") else "") for i, it in enumerate(items)]
                 said = speak(". ".join(lines) + ". Which one?", cache=False, interruptible=True)
-                audio = record_request(src, floor, wait=FIRST_WAIT, prefix=said)
+                audio = self.listen_answer(wait=FIRST_WAIT, prefix=said)
+                if audio is None: return
                 if len(audio) < RATE * 0.4: speak("OK."); return
                 self.beep(); answer = transcribe(audio.astype(np.float32) / 32768.0, "One, two, three, four, five.")
                 chosen = pick(answer, items); log(f"pick: {answer!r} → {chosen['title'] if chosen else None}")
@@ -591,14 +609,25 @@ class Jarvis:
         src, transcribe, floor = self.src, self.transcribe, self.floor
         speak = self.speak
         said = speak(question, interruptible=True)
-        audio = record_request(src, floor, wait=FIRST_WAIT, prefix=said)
-        if len(audio) < RATE * 0.4: log("confirmation: no answer"); return False
+        audio = self.listen_answer(wait=FIRST_WAIT, prefix=said)
+        if audio is None or len(audio) < RATE * 0.4: log("confirmation: no answer"); return False
         self.beep()
         answer = transcribe(audio.astype(np.float32) / 32768.0, "Yes. No.")
         yes = bool(re.match(r"\W*(yes|yeah|yep|yup|sure|do it|go ahead|go for it|correct|confirm(ed)?|please do|absolutely|ok(ay)?|right|definitely)\b",
                             answer, flags=re.I)) and not re.search(r"\b(no|not|don'?t|cancel|wait)\b", answer, flags=re.I)
         log(f"confirmation: {answer!r} → {'yes' if yes else 'no'}")
         return yes
+
+    def listen_answer(self, wait=None, prefix=None):
+        """record_request, but a dead microphone (MicDead) is reopened and you are asked again once; still dead:
+        tell you and give up (empty audio)."""
+        try: return record_request(self.src, self.floor, wait=wait, prefix=prefix)
+        except MicDead: pass
+        self.src.pause(); self.src.resume()                # a fresh capture
+        said = self.speak("Sorry, I lost you for a moment. Say that again?", interruptible=True)
+        try: return record_request(self.src, self.floor, wait=wait, prefix=said)
+        except MicDead:
+            self.speak("I can't hear you. Please check the microphone."); return None   # None: already told you
 
     def request_after_wake(self, st, timer, interrupted=False):
         """openWakeWord fires a little after the word, so part of "hey Jarvis, <request>" may already be past: the
@@ -634,6 +663,7 @@ class Jarvis:
     def step(self):
         """Process one frame: follow-ups, closing the mic for WSLg playback, the noise floor, the wake word."""
         self.n += 1; n = self.n
+        if n % 375 == 1: self.heartbeat()                  # every ~30 s: the Windows player stays while we run
         src, lock, args, shared, followup = self.src, self.lock, self.args, self.shared, self.followup
         spotter, oww, wake_key = self.spotter, self.oww, self.wake_key
         converse, forget_wake = self.converse, self.forget_wake
@@ -668,8 +698,9 @@ class Jarvis:
             if playing and n % 3 == 0: self.playing_until = time.time() + 0.5
             needed = PLAYING_THRESHOLD if playing else args.threshold
             if playing and self.reply_says_wake_word(): needed = max(args.threshold, 0.7)   # the reply itself says "Jarvis"
-            if playing and 0.2 <= score < needed and time.time() - self.last_near > 2:
-                log(f"near miss during a reply: wake score {score:.2f} (needs {needed})"); self.last_near = time.time()
+            if 0.3 <= score < needed and time.time() - self.last_near > 2:   # a wake word that almost made it
+                log(f"near miss{' during a reply' if playing else ''}: wake score {score:.2f} (needs {needed})")
+                self.last_near = time.time()
             if score < needed: return True
         self.handle_wake(score, rest, frames, talking)
         return True

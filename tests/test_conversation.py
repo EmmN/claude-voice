@@ -8,7 +8,8 @@ import listen
 from listen import FRAME
 
 SAY = [800] * 10 + [0] * 36          # you say something, then 2.9 s of quiet (VOICE_SILENCE is 2.5 s)
-NOTHING = [0] * 110                  # silence longer than the 8 s first wait
+NOTHING = [30] * 110                 # a quiet room (level 30, no voice) for longer than the 8 s first wait
+DEAD = [0] * 30                      # digital silence for 2.4 s: a dead microphone
 
 
 class Mic:
@@ -205,6 +206,27 @@ class InterruptingAReply(Conversation):
 
 
 class Robustness(Conversation):
+    def test_a_dead_microphone_is_reopened_and_you_are_asked_again(self):
+        key = self.add_session("payments")
+        j = self.jarvis(NOTHING[:15], DEAD, SAY, transcripts=["", "check the logs"])
+        reopened = []
+        j.src.pause = lambda: reopened.append(True)
+        said = self.wake(j)
+        self.assertEqual(said[:2], ["OK, payments. What do you want me to do?", "Sorry, I lost you for a moment. Say that again?"])
+        self.assertTrue(reopened)
+        self.assertEqual(self.read(self.shared, "inbox", key + ".msg"), "check the logs\n")
+
+    def test_still_dead_tells_you_to_check_the_microphone(self):
+        self.add_session("payments")
+        said = self.wake(self.jarvis(NOTHING[:15], DEAD, DEAD, transcripts=[""]))
+        self.assertEqual(said[-1], "I can't hear you. Please check the microphone.")
+
+    def test_an_empty_transcript_is_asked_again_once(self):
+        key = self.add_session("payments")
+        said = self.wake(self.jarvis(NOTHING[:15], SAY, SAY, transcripts=["", "", "check the logs"]))
+        self.assertEqual(said[1], "Sorry, say that again?")
+        self.assertEqual(self.read(self.shared, "inbox", key + ".msg"), "check the logs\n")
+
     def test_the_brain_session_answers_unnamed_questions(self):
         self.add_session("webshop_7c"); key = self.add_session("jarvis")
         with open(os.path.join(self.shared, "jarvis_brain"), "w") as f: f.write(key)
@@ -243,3 +265,8 @@ class Robustness(Conversation):
         frame = src.frame()                                         # 2 s without audio
         self.assertEqual(int(np.abs(frame).sum()), 0)
         self.assertIsNotNone(src.proc.wait(timeout=5))              # the stalled capture was ended (the reader reopens it)
+
+    def test_the_listener_leaves_a_heartbeat_for_the_windows_player(self):
+        j = self.jarvis([30] * 3)
+        j.step()
+        self.assertTrue(os.path.exists(os.path.join(self.shared, "listener.alive")))
