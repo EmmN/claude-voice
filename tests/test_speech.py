@@ -52,11 +52,14 @@ class Speech(VoiceTest):
         p = self.say("a reply that gets interrupted", wait=False)
         self.assertTrue(self.until(lambda: any(e.startswith("play") for e in self.audio_events())))
         lock_holder = None
+        time.sleep(1.1)                                              # into its third sentence (fake: one per 0.5 s)
         with open(self.stop_file, "w") as f: f.write("wake")       # what the listener does on "hey Jarvis"
-        self.assertTrue(self.until(lambda: "say: interrupted (wake); replaying after the conversation" in self.speech_log()))
+        self.assertTrue(self.until(lambda: any(l.startswith("say: interrupted (wake); going on from") for l in self.speech_log())))
         lock_holder = self.hold_lock(); time.sleep(1); lock_holder.close()   # the conversation
         p.wait(timeout=20)
         self.assertEqual(len([e for e in self.audio_events() if e.startswith("play")]), 2)   # played again
+        cut = [e for e in self.audio_events() if e.startswith("cut ")]
+        self.assertIn(cut, (["cut 0.50"], ["cut 1.00"]))   # the start of the sentence it was cut in, not the top
         self.assertEqual(self.speech_log()[-1], "say: played")
 
     def test_stop_drops_it(self):

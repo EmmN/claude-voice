@@ -21,7 +21,7 @@ MAX="${SAY_MAX_CHARS:-2400}"   # about 400 words, two to three minutes
 T0=$(now_ns)
 # The stop file is touched to cut speech (the Windows player and `play` watch it); its content says why. "stop"
 # (`voice stop`) drops this reply, also while it is still queued. "wake" / "barge" (you started talking to Jarvis)
-# only pause it: it is played again from the start once the conversation has let go of the lock.
+# only pause it: once the conversation has let go of the lock it goes on from the start of the sentence it was cut in.
 STOP="${LOCK%.lock}.stop"
 stop_since() { [ -f "$STOP" ] && newer_or_equal "$(mtime_ns "$STOP")" "$1"; }
 stop_kind() { cat "$STOP" 2>/dev/null; }
@@ -34,7 +34,7 @@ system_voice() {   # only without piper; PowerShell can take 15 s to start on WS
 }
 wav="$STATE_DIR/say-$$.wav"; trap 'rm -f "$wav"' EXIT
 # synthesize before queueing for the lock, so a queued reply starts the moment the previous one ends
-if ! { command -v piper >/dev/null && [ -s "$VOICE" ] && printf '%s' "$text" | piper -m "$VOICE" --length-scale "$SPEED" -f "$wav" >/dev/null 2>&1; }; then
+if ! { command -v piper >/dev/null && [ -s "$VOICE" ] && printf '%s' "$text" | piper -m "$VOICE" --length-scale "$SPEED" --sentence-silence "${SAY_SENTENCE_SILENCE:-0.3}" -f "$wav" >/dev/null 2>&1; }; then
   wav=""   # no piper: the system voice, as the last resort
 fi
 # replies play a bit quieter (VOICE_REPLY_VOLUME, 0.6): the microphone then hears "hey Jarvis" over them more easily
@@ -50,6 +50,13 @@ listening() { [ -f "$LISTENING" ] && [ $(( $(date +%s) - $(mtime "$LISTENING") )
 # the waiting reply lets go of the lock meanwhile, so a conversation you start in the gap goes first
 LAST_END="$VOICE_SHARED/last_reply_end"
 gap_left() { [ -f "$LAST_END" ] && awk -v e="$(mtime_ns "$LAST_END")" -v n="$(now_ns)" -v g="${VOICE_REPLY_GAP:-5}" 'BEGIN { r = e + g - n; if (r > 0) { printf "%.1f", r; exit 0 } exit 1 }'; }
+# where to go on after an interruption `$1` seconds in: the start of that sentence (the end of the last pause in the
+# speech before it: piper leaves SAY_SENTENCE_SILENCE, 0.3 s, between sentences), else the beginning
+resume_at() {
+  ffmpeg -nostdin -hide_banner -i "$wav" -af silencedetect=noise=-40dB:d=0.2 -f null - 2>&1 |
+    awk -v t="$1" '/silence_end:/ { for (i = 1; i <= NF; i++) if ($i == "silence_end:" && $(i+1) + 0.3 <= t) p = $(i+1) }
+                   END { printf "%.2f", p + 0 }'
+}
 attempt=0
 while [ "$attempt" -lt 3 ]; do
   # wait for the lock: a conversation with Jarvis holds it, and a reply must not talk over you (3 min, then anyway)
@@ -67,7 +74,11 @@ while [ "$attempt" -lt 3 ]; do
   "$HERE/play" "$wav"
   rm -f "$VOICE_SHARED/speaking"   # per platform: the Windows-side player / WSLg, afplay, PulseAudio (at VOICE_REPLY_VOLUME)
   if stop_since "$start" && [ "$(stop_kind)" != stop ]; then
-    speech_log "say: interrupted ($(stop_kind)); replaying after the conversation"
+    at=$(resume_at "$(awk -v a="$(mtime_ns "$STOP")" -v b="$start" 'BEGIN { print a - b }')")
+    if [ "$at" != 0.00 ] && ffmpeg -nostdin -hide_banner -loglevel error -ss "$at" -i "$wav" -y "$wav.r.wav" 2>/dev/null && [ -s "$wav.r.wav" ]; then
+      mv -f "$wav.r.wav" "$wav"
+    fi
+    speech_log "say: interrupted ($(stop_kind)); going on from ${at} s after the conversation"
     flock -u 9; sleep 1; continue
   fi
   : > "$LAST_END"; speech_log "say: played"; exit 0

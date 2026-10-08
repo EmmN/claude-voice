@@ -89,6 +89,15 @@ class SpeechDetection(unittest.TestCase):
         audio = listen.record_request(src, noise_floor=10, wait=3)
         self.assertGreater(len(audio), FRAME * 10)
 
+    def test_a_softer_voice_keeps_the_recording_going(self):
+        # loud start, then 4 s of a softer voice (level 80: under the 120 bar, over half of it), then quiet
+        src = FakeSource([800] * 10 + [80] * 50 + [0] * 60)
+        with unittest.mock.patch.object(listen, "SILENCE_TO_STOP", 2.5):
+            audio = listen.record_request(src, noise_floor=10, wait=3)
+        self.assertGreaterEqual(len(audio), FRAME * 60)                  # the soft part was kept
+        src = FakeSource([80] * 50 + [0] * 60)                          # but a soft sound alone never starts one
+        self.assertEqual(len(listen.record_request(src, noise_floor=10, wait=3)), 0)
+
     def test_nobody_answers(self):   # a quiet room still has a little noise (level 30)
         self.assertEqual(len(listen.record_request(FakeSource([30] * 60), noise_floor=10, wait=2)), 0)
 
