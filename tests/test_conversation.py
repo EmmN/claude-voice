@@ -25,11 +25,12 @@ class TestJarvis(listen.Jarvis):
     """Jarvis with its outside world recorded: what it says, beeps and the tools it would run."""
     def __init__(self, *a, transcripts=(), **kw):
         super().__init__(*a, **kw)
-        self.said, self.tools, self.transcripts, self.beeps = [], [], list(transcripts), 0
+        self.said, self.tools, self.transcripts, self.beeps, self.wake_chimes = [], [], list(transcripts), 0, 0
         self.transcribe = lambda audio, hint: self.transcripts.pop(0) if self.transcripts else ""
     def say_prompt(self, text, cache=True): self.said.append(text)
     def play_interruptible(self, text, cache=True): self.said.append(text); return None
     def beep(self): self.beeps += 1
+    def wake_chime(self): self.wake_chimes += 1
     def run_tool(self, name, *argv):
         self.tools.append((name, *argv)); return types.SimpleNamespace(returncode=0, stdout=f"{name} ok", stderr="")
 
@@ -61,6 +62,13 @@ class Conversation(VoiceTest):
         self.assertEqual(said[1], "OK, payments. What do you want me to do?")
         self.assertEqual(said[2], "Sent to payments. It will get it after its next turn.")
         self.assertEqual(self.read(self.shared, "inbox", key + ".msg"), "run the tests\n")
+
+    def test_wake_chimes_before_listening(self):
+        self.add_session("payments")
+        j = self.jarvis(NOTHING[:15], SAY, transcripts=["", "check the logs"])
+        self.wake(j)
+        self.assertEqual(j.wake_chimes, 1)
+        self.assertEqual(j.beeps, 1)                     # and the end-of-recording beep after "check the logs"
 
     def test_one_session_is_greeted_by_name(self):
         self.add_session("payments")

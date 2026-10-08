@@ -134,6 +134,8 @@ def chime():
                         "-ar", "22050", "-ac", "1", "-y", wav], check=False)
     subprocess.run([os.path.join(HERE, "play"), wav], check=False, stdin=subprocess.DEVNULL)
 
+WAKE_CHIME = os.environ.get("VOICE_WAKE_CHIME", "1") != "0"   # beep when the wake word is heard (0: off)
+
 VAD_MIN = float(os.environ.get("VOICE_VAD", "0.5"))   # speech probability a loud frame needs to count as you talking
 _vad = None
 def speech_prob(frame):
@@ -421,6 +423,8 @@ class Jarvis:
     # --- seams: the outside world ----------------------------------------------------------------------------------
     def say_prompt(self, text, cache=True): prompt(text, cache)
     def beep(self): chime()
+    def wake_chime(self):
+        if WAKE_CHIME: chime()
     def dispatch(self, text, env):
         return subprocess.run([os.path.join(HERE, "dispatch"), text], capture_output=True, text=True, env=env)
     def run_tool(self, name, *argv):
@@ -718,6 +722,7 @@ class Jarvis:
         if interrupted: lock.interrupt()           # the wake phrase during a reply: stop it (and the queued ones)
         self.request_sent = False
         lock.acquire(); warm_brain()               # the model loads while you talk, if ollama unloaded it
+        if not args.no_ack: self.wake_chime()      # the same beep as at the end of a recording: I'm listening
         try:
             if os.path.exists(followup): os.remove(followup)   # you called: a pending "anything else?" is moot
             st = state()

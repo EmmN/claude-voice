@@ -252,6 +252,7 @@ you type /speak on
    │  ("Hey Claude, <request>" in one breath skips the greeting; VOICE_WAKE=hey_jarvis uses openWakeWord instead)
    │  something talking? ─► touch .claude-voice.stop ─► the player and every `say`, in every distro, stop at once
    │  take .claude-voice.lock (so nothing speaks while you talk and Jarvis never hears itself)
+   │  beep (VOICE_WAKE_CHIME): I heard the wake word, listening
    ▼
  "Which session: A or B?"                                  cached wav, plays at once
    │  (one session only: "OK, A. What do you want me to do?")
@@ -363,6 +364,7 @@ for audio, which goes through PulseAudio.
 | `VOICE_WAIT` | `3.5` | silence after a later Jarvis prompt ("Which session?") that ends the conversation |
 | `VOICE_FOLLOWUP=1` | off | after a spoken request's reply is read, ask "Anything else for <session>?" and listen (confusing with several sessions, hence off) |
 | `VOICE_WAKE` | `hey claude` | the wake phrase: any words (spotted by Whisper) or a bundled openWakeWord model name (`hey_jarvis`, `alexa`, …) |
+| `VOICE_WAKE_CHIME` | `1` | beep as soon as the wake word is heard (the same beep that ends a recording); `0` turns it off |
 | `VOICE_WAKE_THRESHOLD` | `0.5` | openWakeWord models only: sensitivity; lower is more sensitive |
 | `VOICE_WAKE_THRESHOLD_PLAYING` | `0.4` | the same while a session's reply is playing (its echo masks your voice); near misses are logged |
 | `VOICE_REPLY_GAP` | `5` | seconds of quiet between two session replies, to tell them apart and say "hey Jarvis" in between (Jarvis's own prompts are not delayed) |
