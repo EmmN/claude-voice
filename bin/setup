@@ -55,6 +55,8 @@ if [ "$PLATFORM" = wsl ] && command -v powershell.exe >/dev/null; then
     if player_alive; then touch "$VOICE_SHARED/player.quit"; for _ in $(seq 30); do player_alive || break; sleep 0.2; done; fi
     rm -f "$VOICE_SHARED/player.starting" "$VOICE_SHARED/player.quit" "$VOICE_SHARED/player.alive"
   fi
+  # the microphone on the Windows side too (listen.py runs it; WSLg's capture is later and stalls)
+  cmp -s "$HERE/../windows/mic.ps1" "$VOICE_SHARED/mic.ps1" || cp "$HERE/../windows/mic.ps1" "$VOICE_SHARED/mic.ps1"
   # not started here: `claude-voice start` and `play` start it when speech is needed, and it quits when idle
   echo "   installed (starts with the listener or the first spoken reply)"
 elif [ "$PLATFORM" = wsl ]; then echo "   powershell.exe not reachable; speech uses WSLg audio"; fi

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Always-on voice listener: wake phrase (VOICE_WAKE, default "hey claude") → record the request → Whisper on the GPU → dispatch to a
 Claude Code session → spoken acknowledgement. Run through the `listen` wrapper (venv + CUDA libs)."""
-import argparse, fcntl, hashlib, json, os, re, signal, subprocess, sys, threading, time, traceback, warnings, wave
+import argparse, fcntl, hashlib, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback, warnings, wave
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,11 +76,19 @@ def warm_brain():
     """Load the local brain's ollama model in the background (it is unloaded when idle; loading takes seconds)."""
     subprocess.Popen([os.path.join(HERE, "brain"), "--warm"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def windows_mic(shared):
+    """On WSL the microphone is recorded on the Windows side (windows/mic.ps1, installed by setup) unless
+    VOICE_MIC_SOURCE=pulse or VOICE_MIC names a PulseAudio source: WSLg's route (RDP audio into PulseAudio) is later
+    and stalls. The script path, or None for ffmpeg."""
+    if PLATFORM != "wsl" or os.environ.get("VOICE_MIC") or os.environ.get("VOICE_MIC_SOURCE", "windows") != "windows": return None
+    ps1 = os.path.join(shared, "mic.ps1")
+    return ps1 if os.path.exists(ps1) and shutil.which("powershell.exe") else None
+
 def mic_safe(shared):
     """Can the mic stay open while we play audio? Yes on macOS and plain Linux. On WSL only while windows/player.ps1
     runs (speech then goes out through Windows): WSLg breaks playback up while a recording stream is open in the same
     distro, so without the player the mic is closed during speech (and barge-in is off)."""
-    if PLATFORM != "wsl": return True
+    if PLATFORM != "wsl" or windows_mic(shared): return True   # no WSLg recording stream open: nothing to break
     try: return time.time() - os.path.getmtime(os.path.join(shared, "player.alive")) <= 3
     except OSError: return False
 
@@ -186,17 +194,26 @@ class Source:
     Jarvis talked). frame() takes the next frame; drain() drops what piled up (Jarvis's own voice); a capture that
     dies is reopened by the thread. pause()/resume() close and reopen it (only for WSLg playback, which breaks up
     while a recording stream is open in the same distro)."""
-    def __init__(self, wav=None, mic=None):
+    def __init__(self, wav=None, mic=None, shared=None):
         if wav:
             w = wave.open(wav); assert w.getframerate() == RATE and w.getnchannels() == 1, "need 16 kHz mono wav"
             self.data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16); self.pos = 0; self.mic = None; self.wav = True
             return
         import queue, threading
         self.mic, self.proc, self.paused = mic or "", None, False
+        self.win = windows_mic(shared) if shared else None    # WSL: windows/mic.ps1 instead of ffmpeg + WSLg
+        self.opened, self.got, self.win_failures = 0.0, False, 0
         self.q = queue.Queue(maxsize=int(30 * RATE / FRAME))       # 30 s; the oldest frames go first when full
         self.resume()
         threading.Thread(target=self._reader, daemon=True).start()
     def _open(self):
+        self.opened, self.got = time.time(), False
+        if self.win:   # the same raw 16 kHz mono PCM on stdout; it exits when we close the pipe
+            self.proc = subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                          subprocess.run(["wslpath", "-w", self.win], capture_output=True, text=True).stdout.strip()],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, cwd="/mnt/c")
+            threading.Thread(target=self._stderr, args=(self.proc,), daemon=True).start()
+            return
         # tagged (metadata) so `listen --stop` finds the capture on every platform, and nothing else
         self.proc = subprocess.Popen(["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error"] + mic_input(self.mic) +
                                      ["-ac", "1", "-ar", str(RATE), "-metadata", "comment=claude-voice-capture", "-f", "s16le", "-"],
@@ -222,6 +239,9 @@ class Source:
             if proc is None: time.sleep(0.05); continue
             b = proc.stdout.read(FRAME * 2)
             if len(b) == FRAME * 2:
+                if not self.got:
+                    self.got, self.win_failures = True, 0
+                    if self.win: log(f"microphone: Windows capture, first audio after {time.time() - self.opened:.1f} s")
                 f = np.frombuffer(b, dtype=np.int16)
                 try: self.q.put_nowait(f)
                 except queue.Full:
@@ -230,6 +250,11 @@ class Source:
                     self.q.put_nowait(f)
                 continue
             if self.paused or proc is not self.proc: continue      # closed on purpose
+            if self.win and not self.got:
+                self.win_failures += 1
+                if self.win_failures >= 2:     # twice no audio at all: back to WSLg (ffmpeg + PulseAudio)
+                    log("Windows microphone capture delivered no audio twice; using WSLg (PulseAudio) instead", "warn")
+                    self.win = None
             log("microphone capture ended; reopening it")
             proc.wait(); time.sleep(0.2)                       # short: you are deaf until it is back
             if not self.paused: self._open()
@@ -258,7 +283,8 @@ class Source:
             # no audio for 2 s: paused, reopening, or a capture that stalled without ending (WSLg does that); end a
             # stalled one so the reader thread reopens it
             proc = self.proc
-            if not self.paused and proc is not None and proc.poll() is None:
+            starting = self.win and not self.got and time.time() - self.opened < 30   # PowerShell is still coming up
+            if not self.paused and proc is not None and proc.poll() is None and not starting:
                 log("microphone stalled (no audio for 2 s); reopening it", "warn"); proc.terminate()
             return np.zeros(FRAME, dtype=np.int16)
 
@@ -778,12 +804,12 @@ def main():
         oww, wake_key, spotter = None, args.wake, PhraseSpotter(args.wake, transcribe)
         log(f"listening for '{args.wake}' (phrase spotted by whisper {args.whisper} on {dev})")
     WAKE_NAME[0] = args.wake.replace("_", " ")
-    log(f"config: platform {PLATFORM}, mic {args.mic or 'default'}, silence {SILENCE_TO_STOP}s, first wait {FIRST_WAIT}s, "
+    log(f"config: platform {PLATFORM}, mic {args.mic or ('Windows default' if not args.from_wav and windows_mic(args.shared) else 'default')}, silence {SILENCE_TO_STOP}s, first wait {FIRST_WAIT}s, "
         f"wait {NO_SPEECH}s, barge-in {'on' if BARGE_IN else 'off'}, "
         f"brain {os.environ.get('JARVIS_MODEL') or os.environ.get('SPEECHIFY_MODEL') or 'gemma4:e4b'}"
         + (f", source {args.from_wav}" if args.from_wav else ""))
 
-    lock, src = Lock(args.lock), Source(args.from_wav, args.mic)
+    lock, src = Lock(args.lock), Source(args.from_wav, args.mic, args.shared)
     def stop(*_):
         src.pause(); os._exit(0)   # not sys.exit: CUDA / onnxruntime threads would keep the process (and its lock) alive
     signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
