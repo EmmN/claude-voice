@@ -358,6 +358,7 @@ for audio, which goes through PulseAudio.
 | Variable | Default | Meaning |
 |---|---|---|
 | `VOICE_VAD` | `0.5` | how sure the voice detector (Silero VAD) must be that a loud sound is a person speaking; noise, thuds and hum score near 0. `0` = loudness only |
+| `VOICE_MIC_SOURCE` | `windows` | WSL only: `windows` records the microphone on the Windows side (windows/mic.ps1; faster than WSLg and no stalls, about 10 s to start, falls back to WSLg if it delivers nothing); `pulse` uses WSLg's PulseAudio |
 | `VOICE_SILENCE` | `2.5` | seconds of quiet that end a spoken request; raise it if Jarvis cuts you off |
 | `VOICE_MAX_RECORD` | `45` | longest request in seconds |
 | `VOICE_FIRST_WAIT` | `8` | how long Jarvis waits for your first answer after the session list; then "I didn't hear anything" |

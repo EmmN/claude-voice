@@ -267,7 +267,7 @@ class Robustness(Conversation):
     def test_a_stalled_microphone_is_reopened(self):
         import queue, subprocess as sp
         src = listen.Source.__new__(listen.Source)
-        src.q, src.paused, src.wav = queue.Queue(), False, False
+        src.q, src.paused, src.wav, src.win = queue.Queue(), False, False, None
         src.proc = sp.Popen(["sleep", "30"])
         self.addCleanup(lambda: src.proc.kill() if src.proc.poll() is None else None)
         frame = src.frame()                                         # 2 s without audio

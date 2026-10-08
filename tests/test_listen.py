@@ -125,3 +125,40 @@ class NoiseIsNotSpeech(unittest.TestCase):
         sp = listen.PhraseSpotter("hey claude", lambda a, h: (calls.append(1), "Hey Claude")[1])
         for f in FakeSource([700] * 15 + [0] * 10).frames: sp.feed(f, 120)
         self.assertEqual(calls, [])
+
+
+class MicChoice(unittest.TestCase):
+    """On WSL the microphone is recorded on the Windows side (mic.ps1) unless told otherwise; elsewhere ffmpeg."""
+    def setUp(self):
+        import os, tempfile
+        self.shared = tempfile.mkdtemp(); self.ps1 = os.path.join(self.shared, "mic.ps1")
+        open(self.ps1, "w").close()
+        for p in (unittest.mock.patch.object(listen.shutil, "which", lambda name: "/fake/" + name),
+                  unittest.mock.patch.dict(listen.os.environ, {}, clear=False)):
+            p.start(); self.addCleanup(p.stop)
+        for k in ("VOICE_MIC", "VOICE_MIC_SOURCE"): listen.os.environ.pop(k, None)
+
+    def on(self, platform):
+        return unittest.mock.patch.object(listen, "PLATFORM", platform)
+
+    def test_wsl_uses_the_windows_capture(self):
+        with self.on("wsl"):
+            self.assertEqual(listen.windows_mic(self.shared), self.ps1)
+            self.assertTrue(listen.mic_safe(self.shared))     # no WSLg recording stream: the mic stays open
+
+    def test_mac_and_linux_keep_ffmpeg(self):
+        for platform in ("mac", "linux"):
+            with self.on(platform): self.assertIsNone(listen.windows_mic(self.shared), platform)
+
+    def test_wsl_opt_outs_and_missing_pieces(self):
+        import os
+        with self.on("wsl"):
+            with unittest.mock.patch.dict(os.environ, {"VOICE_MIC_SOURCE": "pulse"}):
+                self.assertIsNone(listen.windows_mic(self.shared))
+                self.assertFalse(listen.mic_safe(self.shared))  # back to WSLg: closed during speech without the player
+            with unittest.mock.patch.dict(os.environ, {"VOICE_MIC": "RDPSource"}):
+                self.assertIsNone(listen.windows_mic(self.shared))
+            with unittest.mock.patch.object(listen.shutil, "which", lambda name: None):
+                self.assertIsNone(listen.windows_mic(self.shared))
+            os.remove(self.ps1)
+            self.assertIsNone(listen.windows_mic(self.shared))
