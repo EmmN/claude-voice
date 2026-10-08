@@ -63,7 +63,7 @@ timestamps), `claude-voice stop`.
 | "Hey Claude." … "Explain the CAP theorem." | the local brain answers short ones; deeper ones go to Jarvis's Claude brain if you set one |
 | "Hey Claude." … "All sessions, summarize what you are doing." | sent to every voice session |
 | "Hey Claude, <request>" while a session's reply is being read | the reply stops, your request goes out, and the reply is read again afterwards |
-| "Hey Claude, stop" (or never mind, or nothing at all) while a reply is being read | the reply and the ones queued behind it are dropped; an interrupted reply is read again only if you then send a request to a session |
+| "Hey Claude, stop" (or never mind, or nothing at all) while a reply is being read | the reply and the ones queued behind it are dropped; an interrupted reply is read again only if you then send a request to a session, and then from the start of the sentence it was cut in |
 | talking while Jarvis asks something ("Which session: …") | it stops talking and takes what you say as the answer |
 | "Hey Claude." … "Stop." / "Never mind." | ends there; nothing is sent |
 | "Hey Claude." … "Payments, run the tests." | a session name followed by a comma addresses it, like "tell payments to run the tests" |

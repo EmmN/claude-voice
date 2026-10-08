@@ -383,7 +383,12 @@ def record_request(src, noise_floor, wait=None, prefix=None):
         frames.append(f); level = rms(f); peak = max(peak, level)
         if is_voice(f, threshold, level): speech_seen, silent = True, 0.0
         else: silent += FRAME / RATE
-        if speech_seen and silent >= SILENCE_TO_STOP and heard() > MIN_SPEECH: break
+        if speech_seen and silent >= SILENCE_TO_STOP and heard() > MIN_SPEECH:
+            # how loud you were against the bar a frame must pass: tells a quiet microphone from a long pause
+            lv = [rms(x) for x in frames]; loud = [x for x in lv if x > threshold]
+            log(f"recorded {heard():.1f} s: speech level median {float(np.median(loud)) if loud else 0:.0f}, "
+                f"{100 * len(loud) / len(lv):.0f}% of frames above threshold {threshold:.0f} (floor {noise_floor:.0f}, peak {peak:.0f})")
+            break
         if not speech_seen and heard() >= 2.0 and peak <= DEAD_MIC:
             # 2 s without even room noise: the capture is dead (WSLg), not you silent; the caller reopens and asks again
             log(f"microphone dead while listening (loudest {peak:.0f} in {heard():.1f} s)", "warn")

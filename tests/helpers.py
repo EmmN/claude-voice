@@ -75,7 +75,12 @@ w.writeframes(bytes(int(22050 * {clip_seconds}) * 2)); w.close()
 import os, shutil, sys, time
 a = sys.argv[1:]; src = a[a.index("-i") + 1] if "-i" in a else ""
 log = open({self.audio_log!r}, "a")
-if "-filter:a" in a:
+if "-af" in a and "silencedetect" in a[a.index("-af") + 1]:   # pauses between sentences: one every 0.5 s
+    log.write("silencedetect" + chr(10)); n = (os.path.getsize(src) - 44) / 44100
+    sys.stderr.write("".join(f"[silencedetect] silence_end: {{t / 2:.2f}} | silence_duration: 0.3" + chr(10) for t in range(1, int(n * 2) + 1)))
+elif "-ss" in a:
+    log.write("cut " + a[a.index("-ss") + 1] + chr(10)); shutil.copy(src, a[-1])
+elif "-filter:a" in a:
     log.write("filter " + a[a.index("-filter:a") + 1] + chr(10)); log.close(); shutil.copy(src, a[-1])
 elif "pulse" in a:
     log.write("play " + os.path.basename(src) + chr(10)); log.close(); time.sleep(max(0.1, (os.path.getsize(src) - 44) / 44100))
