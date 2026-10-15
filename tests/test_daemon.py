@@ -53,6 +53,18 @@ time.sleep(300)
         self.assertGreaterEqual(self.starts_count(), 2)
         self.assertIn("ERROR listener exited (3); restarting in 3 s", self.read(self.voice_home, "listen.log"))
 
+    def test_a_supervisor_that_lost_its_pid_file_stops_restarting(self):
+        # a full test run once left two supervisors looping for good (their throwaway home was deleted under them):
+        # each restart started a listener, which made the real one's audio choppy
+        self.env["FAKE_LISTENER"] = "crash"
+        self.run_bin("listen", "--daemon")
+        sup = self.read(self.voice_home, "listen.pid").strip()
+        os.remove(os.path.join(self.voice_home, "listen.pid"))
+        t = time.time()
+        while os.path.exists(f"/proc/{sup}") and time.time() - t < 10: time.sleep(0.2)
+        self.assertFalse(os.path.exists(f"/proc/{sup}"), "the supervisor kept looping")
+        self.assertIn("no longer the listener of record", self.read(self.voice_home, "listen.log"))
+
     def test_stop_leaves_other_installs_alone(self):
         other = subprocess.Popen(["python3", "-c", "import time; time.sleep(300)", "listen.py", "--lock", "/elsewhere.lock"])
         self.addCleanup(other.kill)

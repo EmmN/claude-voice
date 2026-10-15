@@ -25,8 +25,10 @@ case "${1:-}" in
   --daemon) shift; stop_all >/dev/null   # one listener per machine: clear strays first
             # keep the log small: past 5 MB it becomes listen.log.1 (the previous .1 is dropped)
             if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "${VOICE_LOG_MAX:-5000000}" ]; then mv -f "$LOG" "$LOG.1"; fi
-            # supervised: if the listener exits or crashes it is started again after 3 s
-            nohup bash -c 'while :; do "$0" "$@"; rc=$?; echo "$(date "+%Y-%m-%d %H:%M:%S") ERROR listener exited ($rc); restarting in 3 s"; sleep 3; done' "$0" "$@" >>"$LOG" 2>&1 &
+            # supervised: if the listener exits or crashes it is started again after 3 s, as long as the pid file still
+            # names this supervisor (a stop removes it, a new daemon replaces it; a test's throwaway home disappears),
+            # so a supervisor that was missed, e.g. one in its 3 s pause, ends by itself instead of looping forever
+            VOICE_SUPERVISOR_PID="$PID" nohup bash -c 'while :; do "$0" "$@"; rc=$?; echo "$(date "+%Y-%m-%d %H:%M:%S") ERROR listener exited ($rc); restarting in 3 s"; sleep 3; [ "$(cat "$VOICE_SUPERVISOR_PID" 2>/dev/null)" = "$$" ] || { echo "$(date "+%Y-%m-%d %H:%M:%S") supervisor $$ is no longer the listener of record; stopping"; exit 0; }; done' "$0" "$@" >>"$LOG" 2>&1 &
             echo $! > "$PID"; sleep 1
             if kill -0 "$(cat "$PID")" 2>/dev/null; then echo "listener started (pid $(cat "$PID")), log: $LOG"; else echo "listener failed to start:"; tail -5 "$LOG"; rm -f "$PID"; exit 1; fi; exit 0;;
 esac
