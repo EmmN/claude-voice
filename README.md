@@ -177,6 +177,8 @@ hold-to-talk dictation into the session in front of you; the installer's `sox` p
    └─ 3. Jarvis's Claude brain (a session you picked with /speak jarvis): answers in a few spoken sentences
 ```
 
+With a Claude brain set, layer 2 is skipped: whatever the fixed phrases do not catch goes straight to that session, which answers it or hands it to the right session (Jarvis says "On it."). `JARVIS_LOCAL_FIRST=1` asks the local model first again.
+
 Ollama down or slow (`JARVIS_TIMEOUT`): the sentence goes to the focused session, as before the brain existed. The
 listener asks ollama to keep the model loaded (`JARVIS_KEEP_ALIVE`) and warms it at every "Hey Claude", so a model
 ollama unloaded loads while you are still talking. The session facts come from the hooks: `hook-prompt` marks a

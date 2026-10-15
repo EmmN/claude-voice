@@ -182,6 +182,15 @@ class ClaudeBrainIsTheDefault(VoiceTest):
         out = self.dispatch("can you tell me more about yourself", no_focus=True)
         self.assertTrue(out.startswith("ask jarvis | Request for Jarvis from the user"), out)
 
+    def test_with_a_brain_unmatched_requests_skip_the_local_model_and_the_focus(self):
+        # "stop them" (meaning some processes) once reached the local model, which made it "close the jarvis session"
+        key = self.add_session("jarvis"); self.add_session("webshop_7c")
+        with open(os.path.join(self.shared, "jarvis_brain"), "w") as f: f.write(key)
+        for t in ("stop them, I don't think they are being used", "check my email and Slack"):
+            out = self.dispatch(t)
+            self.assertTrue(out.startswith("ask jarvis | Request for Jarvis from the user"), out)
+            self.assertTrue(out.endswith(t.rstrip(".")), out)
+
     def test_without_a_brain_it_still_asks(self):
         self.add_session("webshop_7c"); self.add_session("jarvis")
         self.assertEqual(self.dispatch("can you tell me more about yourself", no_focus=True), "nomatch which session")

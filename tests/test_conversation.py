@@ -239,7 +239,7 @@ class Robustness(Conversation):
         self.add_session("webshop_7c"); key = self.add_session("jarvis")
         with open(os.path.join(self.shared, "jarvis_brain"), "w") as f: f.write(key)
         j = self.jarvis()
-        self.assertEqual(self.wake(j, rest="what can you do"), ["Let me think about that."])
+        self.assertEqual(self.wake(j, rest="what can you do"), ["On it."])
         self.assertIn("Request for Jarvis", self.read(self.shared, "inbox", key + ".msg"))
 
     def test_a_reply_that_says_the_wake_word_raises_the_bar(self):

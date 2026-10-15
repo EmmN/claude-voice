@@ -238,6 +238,13 @@ else:
             elif k and re.match(r"^[^,:]*[,:]", bare) and take_name(re.split(r"[,:]", bare, 1)[0])[0] == k \
                     and not re.sub(r"[^a-z]", "", take_name(re.split(r"[,:]", bare, 1)[0])[1].lower()):
                 addressed, target, body = True, k, rem                # "<name>, <request>"
+claude_brain = open(brain_path).read().strip() if os.path.exists(brain_path) else ""
+if target is None and not addressed and claude_brain in sessions and os.environ.get("JARVIS_LOCAL_FIRST") != "1":
+    # a Claude brain is set (/speak jarvis): what no fixed phrase matched goes straight to it, not through the local
+    # model, which can misread a request ("stop them" became "close the jarvis session") and adds a second of latency
+    target, addressed, ask = claude_brain, True, True
+    body = "Request for Jarvis from the user (spoken; answer it, or hand it to the right session; reply in one to " \
+           "three short sentences, it will be read aloud): " + text
 if target is None and not addressed and os.environ.get("JARVIS_BRAIN", "1") != "0" and not os.environ.get("DISPATCH_NESTED"):
     # no fixed phrase matched: ask the local brain whether this is for a session or a question for Jarvis itself
     r = subprocess.run([os.path.join(here, "brain"), text], capture_output=True, text=True)

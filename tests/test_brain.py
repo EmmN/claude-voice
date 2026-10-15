@@ -32,8 +32,12 @@ class BrainRouting(VoiceTest):
         self.brain(action="escalate")
         self.assertTrue(self.dispatch("explain the CAP theorem").startswith("answer | I can't answer that one here"))
         with open(os.path.join(self.shared, "jarvis_brain"), "w") as f: f.write(f"{self.distro}__sid-payments")
-        out = self.dispatch("explain the CAP theorem")
+        out = self.dispatch("explain the CAP theorem", env={"JARVIS_LOCAL_FIRST": "1"})
         self.assertTrue(out.startswith("ask payments | Question for Jarvis from the user"), out)
+        calls = len(self.ollama.calls)   # by default a Claude brain gets it straight, without asking the local model
+        out = self.dispatch("explain the CAP theorem")
+        self.assertTrue(out.startswith("ask payments | Request for Jarvis from the user"), out)
+        self.assertEqual(len(self.ollama.calls), calls)
 
     def test_brain_down_falls_back_to_the_focused_session(self):
         self.ollama.fail = True
