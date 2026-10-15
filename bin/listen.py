@@ -58,7 +58,7 @@ def prompt(text, cache=True):
 
 # fixed prompts, synthesized in the background at start so the first "Yes?" after a voice change plays at once
 COMMON_PROMPTS = [
-    "Yes?", "OK.", "Anything else?", "I didn't hear anything.", "What should I tell it?", "Let me think about that.",
+    "Yes?", "OK.", "Anything else?", "I didn't hear anything.", "What should I tell it?", "On it.",
     "Sent to all sessions.", "I could not deliver that.", "I didn't get which one.", "In which project?",
     "OK, no new session.", "OK, I won't resume it.", "OK, I won't open it.", "I found no earlier sessions there.",
     "No sessions.", "Yes? No session has voice on yet. You can start or resume one.",
@@ -632,7 +632,7 @@ class Jarvis:
                 said = speak("What should I tell it?", interruptible=True); continue
             if "which session" in out: said = speak(f"Which session? Open: {spoken_list(st['sessions'])}.", interruptible=True); continue
             if out.startswith(("ask ", "focus ", "sent ", "broadcast")): self.request_sent = True   # the reply may be read again
-            if out.startswith("ask "): speak("Let me think about that.")
+            if out.startswith("ask "): speak("On it.")
             elif out.startswith("focus "): speak(f"Switched to {out[6:]} and sent it.")
             elif out.startswith("sent ") and parts[-1] == "queued":   # its inbox hook is not running yet
                 speak(f"Sent to {out[5:]}. It will get it after its next turn.")
